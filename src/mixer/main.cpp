@@ -15,6 +15,8 @@
 
 #include "mixer/gl_loader.h"
 #include "mixer/ipc/ipc_ring.h"
+#include "vj/Params.h"
+#include "vj/PrimitiveInterceptor.h"
 #include "vj/PrimitiveStream.h"
 
 #include <GLFW/glfw3.h>
@@ -600,6 +602,20 @@ int main() {
     // 0..512 interpolated = continuous "collision amount" knob.
     float relocateBX = 0.0f;
 
+    // libvj effects on the mixed stream. The interceptor lives across frames
+    // (its internal RandomController + DepthDelayQueue need persistence);
+    // each frame we beginFrame with current params, push primitives through,
+    // collect them in a thread_local-free scratch vector via the callback,
+    // and feed the result to the renderer.
+    vj::Params       vjEffectParams;
+    vj::PrimitiveInterceptor vjInterceptor;
+    bool             vjEffectsEnabled = false;
+    std::vector<vj::Primitive> vjPassThruScratch;
+    vjInterceptor.setSubmitCallback([&vjPassThruScratch](const vj::Primitive& p) {
+        vjPassThruScratch.push_back(p);
+    });
+    int vjFrameCounter = 0;
+
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
 
@@ -700,6 +716,21 @@ int main() {
             if (ImGui::Button("Phase C (clean)")) relocateBX = 512.0f;
             ImGui::Separator();
 
+            ImGui::TextUnformatted("libvj effects on the mixed stream:");
+            ImGui::Checkbox("Enable glitch effects", &vjEffectsEnabled);
+            if (vjEffectsEnabled) {
+                ImGui::SliderFloat("MASTER",   &vjEffectParams.master,   0.0f, 1.0f, "%.2f");
+                ImGui::SliderFloat("CHANCE",   &vjEffectParams.chance,   0.0f, 1.0f, "%.2f");
+                ImGui::SliderFloat("GEOMETRY", &vjEffectParams.geometry, 0.0f, 1.0f, "%.2f");
+                ImGui::SliderFloat("TEXTURE",  &vjEffectParams.texture,  0.0f, 1.0f, "%.2f");
+                ImGui::SliderFloat("MISSING",  &vjEffectParams.missing,  0.0f, 1.0f, "%.2f");
+                ImGui::SliderFloat("COLOR",    &vjEffectParams.color,    0.0f, 1.0f, "%.2f");
+                ImGui::SliderFloat("DEPTH",    &vjEffectParams.depth,    0.0f, 1.0f, "%.2f");
+                ImGui::SliderFloat("CHAOS",    &vjEffectParams.chaos,    0.0f, 1.0f, "%.2f");
+                if (ImGui::Button("Reset effects")) vjEffectParams = vj::Params{};
+            }
+            ImGui::Separator();
+
             ImGui::TextDisabled("Recorded .vjr file:");
 
             ImGui::SetNextItemWidth(-180);
@@ -785,35 +816,39 @@ int main() {
 
             lastDrawn = 0;
             if (liveActive) {
-                // Phase B crossfade + Phase C VRAM relocation. Channel A
-                // sits at VRAM origin; channel B is shifted by relocateBX
-                // (0 = collide / Phase B, 512 = clean / Phase C).
+                // For each channel, take its frame's primitives, apply the
+                // crossfade keep-gate, then optionally run them through
+                // libvj's PrimitiveInterceptor for glitch effects, then
+                // draw with the right VRAM x-relocation offset.
                 auto submitChan = [&](const LiveChannel& ch, float keepProb,
                                       float xRelocate) {
                     if (!ch.hasFrame) return;
                     renderer.applyUploads(ch.latest.uploads,
                                           static_cast<int>(xRelocate));
                     if (keepProb <= 0.0f) return;
-                    if (keepProb >= 0.999f) {
-                        lastDrawn += renderer.drawUntextured(
-                            ch.latest.primitives, vpX, vpY, vpW, vpH);
-                        lastDrawn += renderer.drawTextured(
-                            ch.latest.primitives, vpX, vpY, vpW, vpH,
-                            1.0f, xRelocate);
-                        return;
-                    }
                     std::vector<vj::Primitive> kept;
                     kept.reserve(ch.latest.primitives.size());
-                    for (const auto& p : ch.latest.primitives) {
-                        if (rng01() < keepProb) kept.push_back(p);
+                    if (keepProb >= 0.999f) {
+                        kept = ch.latest.primitives;
+                    } else {
+                        for (const auto& p : ch.latest.primitives) {
+                            if (rng01() < keepProb) kept.push_back(p);
+                        }
                     }
-                    lastDrawn += renderer.drawUntextured(
-                        kept, vpX, vpY, vpW, vpH);
-                    lastDrawn += renderer.drawTextured(
-                        kept, vpX, vpY, vpW, vpH, 1.0f, xRelocate);
+                    const std::vector<vj::Primitive>* drawn = &kept;
+                    if (vjEffectsEnabled) {
+                        vjPassThruScratch.clear();
+                        vjInterceptor.beginFrame(vjEffectParams, vjFrameCounter);
+                        for (auto& p : kept) vjInterceptor.interceptAndSubmit(p);
+                        drawn = &vjPassThruScratch;
+                    }
+                    lastDrawn += renderer.drawUntextured(*drawn, vpX, vpY, vpW, vpH);
+                    lastDrawn += renderer.drawTextured(*drawn, vpX, vpY, vpW, vpH,
+                                                       1.0f, xRelocate);
                 };
                 submitChan(chA, 1.0f - crossfade, 0.0f);
                 submitChan(chB, crossfade,        relocateBX);
+                ++vjFrameCounter;
             } else {
                 // File mode (existing behaviour).
                 const vj::EchoFrame& fr =
