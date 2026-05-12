@@ -756,7 +756,11 @@ int main() {
     int twinEnableCC = 13;
     int twinDelayCC  = 14;
     int twinAlphaCC  = 15;
-    int midiLearnTarget = -1;  // 0=twinEnable, 1=twinDelay, 2=twinAlpha
+    // (filterPresetCC=16 is declared in the Filter Preset Bank block below.)
+    int clutModeCC   = 17;
+    int crossfadeCC  = 18;
+    int relocateCC   = 19;
+    int midiLearnTarget = -1;  // 0..2 = twin, 3 = clutMode, 4 = crossfade, 5 = relocate
     int midiLearnSeenCC = -1;
     auto applyMidiOverrides = [&]() {
         if (!midi || !midiOverrideEnabled) return;
@@ -799,6 +803,24 @@ int main() {
     // 512 = Phase C (right half of VRAM for B, clean co-existence)
     // 0..512 interpolated = continuous "collision amount" knob.
     float relocateBX = 0.0f;
+
+    // Phase B / C MIDI overrides — kept separate from applyMidiOverrides()
+    // because their target variables (crossfade, relocateBX, renderer.clutMode)
+    // are declared in this scope and Renderer's clutMode lives on the Renderer
+    // instance. Same master switch (midiOverrideEnabled).
+    auto applyPhaseBmidi = [&]() {
+        if (!midi || !midiOverrideEnabled) return;
+        const int c = midi->getCC(clutModeCC);
+        if (c >= 0) {
+            int m = c / 32;            // 0..31 -> 0 ... 96..127 -> 3
+            if (m > 3) m = 3;          // 127/32 == 3, but guard anyway
+            renderer.clutMode = m;
+        }
+        const int x = midi->getCC(crossfadeCC);
+        if (x >= 0) crossfade = static_cast<float>(x) / 127.0f;
+        const int r = midi->getCC(relocateCC);
+        if (r >= 0) relocateBX = static_cast<float>(r) / 127.0f * 512.0f;
+    };
 
     // libvj effects on the mixed stream. The interceptor lives across frames
     // (its internal RandomController + DepthDelayQueue need persistence);
@@ -849,6 +871,7 @@ int main() {
         // in the same frame override these.
         applyMidiOverrides();
         applyFilterMidi();
+        applyPhaseBmidi();
 
         const double now = glfwGetTime();
         const double dt  = now - lastTickTime;
@@ -1242,6 +1265,10 @@ int main() {
             bindingRow("Twin Self enable",   &twinEnableCC, 0, "(>=64 = on)");
             bindingRow("Twin delay frames",  &twinDelayCC,  1, "(maps 0..127 -> 1..300)");
             bindingRow("Twin ghost bright",  &twinAlphaCC,  2, "(maps 0..127 -> 0..1)");
+            ImGui::TextUnformatted("Phase B / C CC bindings:");
+            bindingRow("CLUT mode",          &clutModeCC,   3, "(0..31=Dir,32..63=Disc,64..95=Noi,96..127=Cln)");
+            bindingRow("Crossfade A<->B",    &crossfadeCC,  4, "(0..127 -> 0..1)");
+            bindingRow("B VRAM relocate",    &relocateCC,   5, "(0..127 -> 0..512, B chaos vs C clean)");
 
             // Process learn: poll lastReceivedCC; when it changes commit it.
             if (midi && midiLearnTarget >= 0) {
@@ -1251,6 +1278,9 @@ int main() {
                         case 0: twinEnableCC = latest; break;
                         case 1: twinDelayCC  = latest; break;
                         case 2: twinAlphaCC  = latest; break;
+                        case 3: clutModeCC   = latest; break;
+                        case 4: crossfadeCC  = latest; break;
+                        case 5: relocateCC   = latest; break;
                     }
                     midiLearnTarget = -1;
                 }
