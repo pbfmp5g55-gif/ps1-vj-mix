@@ -292,25 +292,26 @@ struct Renderer {
         return true;
     }
 
-    void applyUploads(const std::vector<vj::VRAMUpload>& uploads) {
+    void applyUploads(const std::vector<vj::VRAMUpload>& uploads,
+                      int xRelocate = 0) {
         if (uploads.empty()) return;
         glBindTexture(GL_TEXTURE_2D, vramTex);
         std::vector<uint32_t> patch;
         for (const auto& u : uploads) {
+            const int ux = u.x + xRelocate;
             if (u.w <= 0 || u.h <= 0) continue;
-            if (u.x < 0 || u.y < 0) continue;
-            if (u.x + u.w > kVRAMWidth || u.y + u.h > kVRAMHeight) continue;
+            if (ux < 0 || u.y < 0) continue;
+            if (ux + u.w > kVRAMWidth || u.y + u.h > kVRAMHeight) continue;
             const size_t n = static_cast<size_t>(u.w) * u.h;
             patch.resize(n);
             for (size_t i = 0; i < n && i < u.data.size(); ++i) {
                 patch[i] = convertPSX16toRGBA8(u.data[i]);
             }
-            glTexSubImage2D(GL_TEXTURE_2D, 0, u.x, u.y, u.w, u.h,
+            glTexSubImage2D(GL_TEXTURE_2D, 0, ux, u.y, u.w, u.h,
                             GL_RGBA, GL_UNSIGNED_BYTE, patch.data());
-            // Mirror the patch so we never lose state.
             for (int row = 0; row < u.h; ++row) {
                 const size_t srcOff = static_cast<size_t>(row) * u.w;
-                const size_t dstOff = static_cast<size_t>(u.y + row) * kVRAMWidth + u.x;
+                const size_t dstOff = static_cast<size_t>(u.y + row) * kVRAMWidth + ux;
                 std::memcpy(&vramMirror[dstOff], &patch[srcOff],
                             static_cast<size_t>(u.w) * sizeof(uint32_t));
             }
@@ -457,14 +458,15 @@ struct Renderer {
     int drawTextured(const std::vector<vj::Primitive>& prims,
                      int viewportX, int viewportY,
                      int viewportW, int viewportH,
-                     float colorMul = 1.0f) {
+                     float colorMul = 1.0f,
+                     float uvRelocateX = 0.0f) {
         texVerts.clear();
         texVertsSemi.clear();
         int drawn = 0;
         for (const auto& p : prims) {
             if (!p.textured) continue;
             const uint64_t tpageRaw = (p.hostTag >> 24) & 0xFFFF;
-            const float TPageBaseX = static_cast<float>((tpageRaw & 0xF) * 64);
+            const float TPageBaseX = static_cast<float>((tpageRaw & 0xF) * 64) + uvRelocateX;
             const float TPageBaseY = static_cast<float>(((tpageRaw >> 4) & 0x1) * 256);
             std::vector<float>& bucket =
                 (p.blendMode == vj::BlendMode::Opaque) ? texVerts : texVertsSemi;
@@ -592,6 +594,12 @@ int main() {
         return std::uniform_real_distribution<float>(0.0f, 1.0f)(cfRng);
     };
 
+    // Phase C: VRAM relocation amount for channel B's uploads + UVs.
+    // 0   = Phase B (shared VRAM, sources collide → glitches)
+    // 512 = Phase C (right half of VRAM for B, clean co-existence)
+    // 0..512 interpolated = continuous "collision amount" knob.
+    float relocateBX = 0.0f;
+
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
 
@@ -685,6 +693,11 @@ int main() {
             channelRow(chB, "B");
             ImGui::SliderFloat("Crossfade A<->B", &crossfade, 0.0f, 1.0f, "%.2f");
             ImGui::TextDisabled("(0=A only, 0.5=both half-density, 1=B only)");
+            ImGui::SliderFloat("B VRAM relocate X", &relocateBX, 0.0f, 512.0f, "%.0f");
+            ImGui::TextDisabled("(0 = Phase B chaos, 512 = Phase C clean, mid = partial collision)");
+            if (ImGui::Button("Phase B (collide)")) relocateBX = 0.0f;
+            ImGui::SameLine();
+            if (ImGui::Button("Phase C (clean)")) relocateBX = 512.0f;
             ImGui::Separator();
 
             ImGui::TextDisabled("Recorded .vjr file:");
@@ -772,20 +785,23 @@ int main() {
 
             lastDrawn = 0;
             if (liveActive) {
-                // Phase B crossfade: keep prims from A with prob (1-cf),
-                // from B with prob cf. VRAM uploads always apply.
-                auto submitChan = [&](const LiveChannel& ch, float keepProb) {
+                // Phase B crossfade + Phase C VRAM relocation. Channel A
+                // sits at VRAM origin; channel B is shifted by relocateBX
+                // (0 = collide / Phase B, 512 = clean / Phase C).
+                auto submitChan = [&](const LiveChannel& ch, float keepProb,
+                                      float xRelocate) {
                     if (!ch.hasFrame) return;
-                    renderer.applyUploads(ch.latest.uploads);
+                    renderer.applyUploads(ch.latest.uploads,
+                                          static_cast<int>(xRelocate));
                     if (keepProb <= 0.0f) return;
                     if (keepProb >= 0.999f) {
                         lastDrawn += renderer.drawUntextured(
                             ch.latest.primitives, vpX, vpY, vpW, vpH);
                         lastDrawn += renderer.drawTextured(
-                            ch.latest.primitives, vpX, vpY, vpW, vpH);
+                            ch.latest.primitives, vpX, vpY, vpW, vpH,
+                            1.0f, xRelocate);
                         return;
                     }
-                    // Probabilistic gate: copy a kept subset out then draw.
                     std::vector<vj::Primitive> kept;
                     kept.reserve(ch.latest.primitives.size());
                     for (const auto& p : ch.latest.primitives) {
@@ -794,10 +810,10 @@ int main() {
                     lastDrawn += renderer.drawUntextured(
                         kept, vpX, vpY, vpW, vpH);
                     lastDrawn += renderer.drawTextured(
-                        kept, vpX, vpY, vpW, vpH);
+                        kept, vpX, vpY, vpW, vpH, 1.0f, xRelocate);
                 };
-                submitChan(chA, 1.0f - crossfade);
-                submitChan(chB, crossfade);
+                submitChan(chA, 1.0f - crossfade, 0.0f);
+                submitChan(chB, crossfade,        relocateBX);
             } else {
                 // File mode (existing behaviour).
                 const vj::EchoFrame& fr =
