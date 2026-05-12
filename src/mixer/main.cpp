@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -568,15 +569,28 @@ int main() {
     int    twinDelayFrames = 60;  // ~1 second at 60 fps
     float  twinAlpha = 0.5f;      // colour-mul factor for the ghost
 
-    // Live IPC mode: attach to a pcsx-redux fork's shared-memory ring.
-    char                 liveNameBuf[128] = "Local\\vj-mix-prim-A";
-    vjmix::IpcRingReader liveReader;
-    vj::EchoFrame        liveBuilding;   // accumulates records until FrameEnd
-    vj::EchoFrame        liveLatest;     // the most-recently-completed frame
-    bool                 liveHasFrame = false;
-    int                  liveFramesSeen = 0;
-    std::vector<uint8_t> liveRecBuf;     // scratch
+    // Live IPC mode: two channels A and B for Phase B mixing.
+    struct LiveChannel {
+        char                 nameBuf[128];
+        vjmix::IpcRingReader reader;
+        vj::EchoFrame        building;
+        vj::EchoFrame        latest;
+        bool                 hasFrame = false;
+        int                  framesSeen = 0;
+    };
+    LiveChannel chA, chB;
+    std::strncpy(chA.nameBuf, "Local\\vj-mix-prim-A", sizeof(chA.nameBuf));
+    std::strncpy(chB.nameBuf, "Local\\vj-mix-prim-B", sizeof(chB.nameBuf));
+    std::vector<uint8_t> liveRecBuf;
     liveRecBuf.resize(64 * 1024);
+
+    // Phase B crossfader: 0 = 100% A, 1 = 100% B. Sources at the midpoint
+    // each keep half their primitives via the random gate below.
+    float crossfade = 0.0f;
+    std::mt19937 cfRng(0x5EED5EED);
+    auto rng01 = [&cfRng]() {
+        return std::uniform_real_distribution<float>(0.0f, 1.0f)(cfRng);
+    };
 
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
@@ -593,75 +607,84 @@ int main() {
             }
         }
 
-        // Drain the live ring; commit a frame each time a FrameEnd arrives.
-        if (liveReader.isOpen()) {
+        // Drain each live channel; commit a frame each time a FrameEnd arrives.
+        auto drainChannel = [&](LiveChannel& ch) {
+            if (!ch.reader.isOpen()) return;
             for (int safety = 0; safety < 50000; ++safety) {
                 vjmix::IpcRecordType type;
                 size_t len = 0;
-                if (!liveReader.readRecord(type, liveRecBuf.data(),
-                                           liveRecBuf.size(), len)) {
+                if (!ch.reader.readRecord(type, liveRecBuf.data(),
+                                          liveRecBuf.size(), len)) {
                     break;
                 }
-                if (len > liveRecBuf.size()) continue;  // truncated; skip
+                if (len > liveRecBuf.size()) continue;
                 if (type == vjmix::IpcRecordType::Primitive) {
                     vj::Primitive p;
                     if (unpackLivePrimitive(liveRecBuf.data(), len, p)) {
-                        liveBuilding.primitives.push_back(std::move(p));
+                        ch.building.primitives.push_back(std::move(p));
                     }
                 } else if (type == vjmix::IpcRecordType::VRAMUpload) {
                     vj::VRAMUpload u;
                     if (unpackLiveUpload(liveRecBuf.data(), len, u)) {
-                        liveBuilding.uploads.push_back(std::move(u));
+                        ch.building.uploads.push_back(std::move(u));
                     }
                 } else if (type == vjmix::IpcRecordType::FrameEnd) {
                     uint32_t fi = 0;
                     if (len >= 4) std::memcpy(&fi, liveRecBuf.data(), 4);
-                    liveBuilding.frameIndex = static_cast<int>(fi);
-                    liveLatest = std::move(liveBuilding);
-                    liveBuilding.primitives.clear();
-                    liveBuilding.uploads.clear();
-                    liveHasFrame = true;
-                    ++liveFramesSeen;
+                    ch.building.frameIndex = static_cast<int>(fi);
+                    ch.latest = std::move(ch.building);
+                    ch.building.primitives.clear();
+                    ch.building.uploads.clear();
+                    ch.hasFrame = true;
+                    ++ch.framesSeen;
                 }
             }
-        }
+        };
+        drainChannel(chA);
+        drainChannel(chB);
 
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
 
         if (ImGui::Begin("Controls")) {
-            // Live IPC section first — when active, it overrides the file
-            // source.
-            ImGui::TextUnformatted("Live IPC (shared-memory ring):");
-            ImGui::SetNextItemWidth(-160);
-            ImGui::InputText("##liveName", liveNameBuf, sizeof(liveNameBuf),
-                             liveReader.isOpen() ? ImGuiInputTextFlags_ReadOnly : 0);
-            ImGui::SameLine();
-            if (liveReader.isOpen()) {
-                if (ImGui::Button("Detach")) {
-                    liveReader.close();
-                    liveBuilding = vj::EchoFrame{};
-                    liveLatest   = vj::EchoFrame{};
-                    liveHasFrame = false;
-                    liveFramesSeen = 0;
-                }
-            } else {
-                if (ImGui::Button("Attach")) {
-                    if (!liveReader.open(liveNameBuf)) {
-                        std::fprintf(stderr,
-                                     "[mixer] live attach failed for %s\n",
-                                     liveNameBuf);
+            ImGui::TextUnformatted("Live IPC sources (Phase B):");
+            auto channelRow = [&](LiveChannel& ch, const char* label) {
+                ImGui::PushID(label);
+                ImGui::Text("Channel %s:", label);
+                ImGui::SetNextItemWidth(-160);
+                ImGui::InputText("##name", ch.nameBuf, sizeof(ch.nameBuf),
+                                 ch.reader.isOpen() ? ImGuiInputTextFlags_ReadOnly : 0);
+                ImGui::SameLine();
+                if (ch.reader.isOpen()) {
+                    if (ImGui::Button("Detach")) {
+                        ch.reader.close();
+                        ch.building = vj::EchoFrame{};
+                        ch.latest   = vj::EchoFrame{};
+                        ch.hasFrame = false;
+                        ch.framesSeen = 0;
+                    }
+                } else {
+                    if (ImGui::Button("Attach")) {
+                        if (!ch.reader.open(ch.nameBuf)) {
+                            std::fprintf(stderr,
+                                "[mixer] attach failed for %s\n", ch.nameBuf);
+                        }
                     }
                 }
-            }
-            if (liveReader.isOpen()) {
-                ImGui::Text("Live: ATTACHED, %d frames received", liveFramesSeen);
-                ImGui::Text("Dropped by writer: %u", liveReader.droppedCount());
-                ImGui::Text("Writer heartbeat:  %u", liveReader.writerHeartbeat());
-            } else {
-                ImGui::TextDisabled("Live: idle (Attach to a pcsx-redux ring)");
-            }
+                if (ch.reader.isOpen()) {
+                    ImGui::Text("  %d frames | dropped=%u | hb=%u",
+                                ch.framesSeen, ch.reader.droppedCount(),
+                                ch.reader.writerHeartbeat());
+                } else {
+                    ImGui::TextDisabled("  (idle)");
+                }
+                ImGui::PopID();
+            };
+            channelRow(chA, "A");
+            channelRow(chB, "B");
+            ImGui::SliderFloat("Crossfade A<->B", &crossfade, 0.0f, 1.0f, "%.2f");
+            ImGui::TextDisabled("(0=A only, 0.5=both half-density, 1=B only)");
             ImGui::Separator();
 
             ImGui::TextDisabled("Recorded .vjr file:");
@@ -731,8 +754,10 @@ int main() {
         glClearColor(0.02f, 0.02f, 0.04f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
 
-        const bool haveSource = (liveReader.isOpen() && liveHasFrame) ||
-                                !recording.frames.empty();
+        const bool liveActive =
+            (chA.reader.isOpen() && chA.hasFrame) ||
+            (chB.reader.isOpen() && chB.hasFrame);
+        const bool haveSource = liveActive || !recording.frames.empty();
         if (haveSource && renderer.program) {
             const float aspectPSX = static_cast<float>(kPS1Width) /
                                     static_cast<float>(kPS1Height);
@@ -745,30 +770,51 @@ int main() {
             const int vpX = (displayW - vpW) / 2;
             const int vpY = (displayH - vpH) / 2;
 
-            // Choose source: live (if attached & has a frame) > file.
-            const vj::EchoFrame* frPtr = nullptr;
-            if (liveReader.isOpen() && liveHasFrame) {
-                frPtr = &liveLatest;
-            } else if (!recording.frames.empty()) {
-                frPtr = &recording.frames[static_cast<size_t>(currentFrame)];
+            lastDrawn = 0;
+            if (liveActive) {
+                // Phase B crossfade: keep prims from A with prob (1-cf),
+                // from B with prob cf. VRAM uploads always apply.
+                auto submitChan = [&](const LiveChannel& ch, float keepProb) {
+                    if (!ch.hasFrame) return;
+                    renderer.applyUploads(ch.latest.uploads);
+                    if (keepProb <= 0.0f) return;
+                    if (keepProb >= 0.999f) {
+                        lastDrawn += renderer.drawUntextured(
+                            ch.latest.primitives, vpX, vpY, vpW, vpH);
+                        lastDrawn += renderer.drawTextured(
+                            ch.latest.primitives, vpX, vpY, vpW, vpH);
+                        return;
+                    }
+                    // Probabilistic gate: copy a kept subset out then draw.
+                    std::vector<vj::Primitive> kept;
+                    kept.reserve(ch.latest.primitives.size());
+                    for (const auto& p : ch.latest.primitives) {
+                        if (rng01() < keepProb) kept.push_back(p);
+                    }
+                    lastDrawn += renderer.drawUntextured(
+                        kept, vpX, vpY, vpW, vpH);
+                    lastDrawn += renderer.drawTextured(
+                        kept, vpX, vpY, vpW, vpH);
+                };
+                submitChan(chA, 1.0f - crossfade);
+                submitChan(chB, crossfade);
+            } else {
+                // File mode (existing behaviour).
+                const vj::EchoFrame& fr =
+                    recording.frames[static_cast<size_t>(currentFrame)];
+                renderer.applyUploads(fr.uploads);
+                if (twinEnabled && !recording.frames.empty()) {
+                    const int n = static_cast<int>(recording.frames.size());
+                    int ghostFrame = currentFrame - twinDelayFrames;
+                    while (ghostFrame < 0) ghostFrame += n;
+                    ghostFrame %= n;
+                    const auto& gh = recording.frames[static_cast<size_t>(ghostFrame)];
+                    renderer.drawUntextured(gh.primitives, vpX, vpY, vpW, vpH, twinAlpha);
+                    renderer.drawTextured  (gh.primitives, vpX, vpY, vpW, vpH, twinAlpha);
+                }
+                lastDrawn  = renderer.drawUntextured(fr.primitives, vpX, vpY, vpW, vpH);
+                lastDrawn += renderer.drawTextured  (fr.primitives, vpX, vpY, vpW, vpH);
             }
-            const vj::EchoFrame& fr = *frPtr;
-
-            renderer.applyUploads(fr.uploads);
-
-            // Twin Self only on file mode for now (ringbuffer would need a
-            // history of live frames; current S2.3 ships without).
-            if (twinEnabled && !liveReader.isOpen() && !recording.frames.empty()) {
-                const int n = static_cast<int>(recording.frames.size());
-                int ghostFrame = currentFrame - twinDelayFrames;
-                while (ghostFrame < 0) ghostFrame += n;
-                ghostFrame %= n;
-                const auto& gh = recording.frames[static_cast<size_t>(ghostFrame)];
-                renderer.drawUntextured(gh.primitives, vpX, vpY, vpW, vpH, twinAlpha);
-                renderer.drawTextured  (gh.primitives, vpX, vpY, vpW, vpH, twinAlpha);
-            }
-            lastDrawn  = renderer.drawUntextured(fr.primitives, vpX, vpY, vpW, vpH);
-            lastDrawn += renderer.drawTextured  (fr.primitives, vpX, vpY, vpW, vpH);
         } else {
             lastDrawn = 0;
         }
