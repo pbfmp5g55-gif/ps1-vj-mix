@@ -1,0 +1,61 @@
+name: Windows build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: write   # for softprops/action-gh-release on tag pushes
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Enable MSVC developer environment
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Configure (Ninja + MSVC)
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Smoke test (selftest exe)
+        run: build\vj-mix-ipc-selftest.exe
+        shell: cmd
+
+      - name: Pack release zip
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          New-Item -ItemType Directory -Force release
+          Copy-Item build\vj-mix-spike1.exe        release\
+          Copy-Item build\vj-mix-ipc-selftest.exe  release\
+          Copy-Item README.md                       release\
+          Copy-Item -Recurse design                 release\
+          if (Test-Path USAGE.md) { Copy-Item USAGE.md release\ }
+          Compress-Archive -Path release\* -DestinationPath ps1-vj-mix-windows-x64.zip
+        shell: pwsh
+
+      - name: Upload artifact (always)
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ps1-vj-mix-windows-x64-${{ github.sha }}
+          path: |
+            build/vj-mix-spike1.exe
+            build/vj-mix-ipc-selftest.exe
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ps1-vj-mix-windows-x64.zip
+          generate_release_notes: true
