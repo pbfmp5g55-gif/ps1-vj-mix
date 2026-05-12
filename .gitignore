@@ -1,0 +1,20 @@
+build/
+build-*/
+*.exe
+*.dll
+*.obj
+*.o
+*.a
+*.lib
+
+# Editor leftovers
+*.swp
+*~
+.vs/
+.idea/
+.vscode/
+*.user
+
+# Local config / personal session data
+local.cmake
+*.vjr
