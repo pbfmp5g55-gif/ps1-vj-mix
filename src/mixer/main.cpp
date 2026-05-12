@@ -163,19 +163,32 @@ struct Renderer {
 
     int drawUntextured(const std::vector<vj::Primitive>& prims,
                        int viewportX, int viewportY,
-                       int viewportW, int viewportH) {
+                       int viewportW, int viewportH,
+                       float colorMul = 1.0f) {
         verts.clear();
         int drawn = 0;
         for (const auto& p : prims) {
             if (p.textured) continue;
+            auto pushDim = [&](const vj::Vertex& a, const vj::Vertex& b,
+                               const vj::Vertex& c) {
+                auto push = [&](const vj::Vertex& v) {
+                    verts.push_back(v.x);
+                    verts.push_back(v.y);
+                    verts.push_back((v.r / 255.0f) * colorMul);
+                    verts.push_back((v.g / 255.0f) * colorMul);
+                    verts.push_back((v.b / 255.0f) * colorMul);
+                    verts.push_back(v.a / 255.0f);
+                };
+                push(a); push(b); push(c);
+            };
             if (p.kind == vj::PrimitiveKind::Triangle &&
                 p.vertices.size() >= 3) {
-                pushTri(p.vertices[0], p.vertices[1], p.vertices[2]);
+                pushDim(p.vertices[0], p.vertices[1], p.vertices[2]);
                 ++drawn;
             } else if (p.kind == vj::PrimitiveKind::Quad &&
                        p.vertices.size() >= 4) {
-                pushTri(p.vertices[0], p.vertices[1], p.vertices[2]);
-                pushTri(p.vertices[1], p.vertices[3], p.vertices[2]);
+                pushDim(p.vertices[0], p.vertices[1], p.vertices[2]);
+                pushDim(p.vertices[1], p.vertices[3], p.vertices[2]);
                 ++drawn;
             }
         }
@@ -260,6 +273,11 @@ int main() {
     double          frameAccum   = 0.0;
     int             lastDrawn    = 0;
 
+    // Twin Self: overlay an N-frame-delayed copy of the current frame.
+    bool   twinEnabled = false;
+    int    twinDelayFrames = 60;  // ~1 second at 60 fps
+    float  twinAlpha = 0.5f;      // colour-mul factor for the ghost
+
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
 
@@ -326,6 +344,14 @@ int main() {
                 ImGui::Text("Source frameIndex: %d", fr.frameIndex);
                 ImGui::Text("Primitives:        %zu", fr.primitives.size());
                 ImGui::Text("Drawn (untextured): %d", lastDrawn);
+
+                ImGui::Separator();
+                ImGui::Checkbox("Twin Self (overlay past frame)", &twinEnabled);
+                if (twinEnabled) {
+                    ImGui::SliderInt("Delay frames", &twinDelayFrames, 1, 300);
+                    ImGui::Text("Delay: %.2f s (at 60 fps)", twinDelayFrames / 60.0f);
+                    ImGui::SliderFloat("Ghost brightness", &twinAlpha, 0.0f, 1.0f, "%.2f");
+                }
             } else {
                 ImGui::TextDisabled("(open a .vjr file)");
             }
@@ -350,6 +376,17 @@ int main() {
             }
             const int vpX = (displayW - vpW) / 2;
             const int vpY = (displayH - vpH) / 2;
+
+            // Draw the ghost (past frame) first so the live frame overdraws
+            // it. Wraps around for files shorter than the requested delay.
+            if (twinEnabled) {
+                const int n = static_cast<int>(recording.frames.size());
+                int ghostFrame = currentFrame - twinDelayFrames;
+                while (ghostFrame < 0) ghostFrame += n;
+                ghostFrame %= n;
+                const auto& gh = recording.frames[static_cast<size_t>(ghostFrame)];
+                renderer.drawUntextured(gh.primitives, vpX, vpY, vpW, vpH, twinAlpha);
+            }
             const auto& fr =
                 recording.frames[static_cast<size_t>(currentFrame)];
             lastDrawn = renderer.drawUntextured(fr.primitives, vpX, vpY, vpW, vpH);
