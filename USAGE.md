@@ -4,10 +4,44 @@ This is the **VJ mixer**. To get pictures on screen you also need at
 least one **pcsx-redux fork** running a PS1 game and pushing its
 primitive stream over IPC. The pcsx-redux fork lives at:
 
-  https://github.com/pbfmp5g55-gif/pcsx-redux — grab the `v0.7.0`
-  Windows release ZIP.
+  https://github.com/pbfmp5g55-gif/pcsx-redux — grab the latest
+  `v0.7.x` Windows release ZIP. **Mixer v0.2.x requires fork v0.7.1
+  or newer** for Clean CLUT mode (older v0.7.0 leaves `hostTag=0`
+  and the mixer's palette lookup samples VRAM(0,0)).
 
 Both repos are Windows-only at the moment.
+
+## What you need before starting
+
+Three things, only one of which is shipped in the ZIP:
+
+1. **The two builds** (mixer + pcsx-redux fork) — provided as release
+   ZIPs above.
+2. **A PS1 BIOS image.** The pcsx-redux fork ships *without* a BIOS;
+   you need to drop one next to `pcsx-redux.exe`. See the
+   **OpenBIOS** section below.
+3. **A game disc image** (`.cue` + `.bin`, or `.iso`). Bring your own
+   dump, or grab a homebrew like PSXFunkin
+   (https://github.com/IgorSou3000/PSXFunkin) which is freely
+   redistributable.
+
+### OpenBIOS
+
+The fork looks for `openbios.bin` (the open-source PS1 BIOS reimplementation
+shipped with pcsx-redux). Drop the file next to `pcsx-redux.exe` and pass
+`-bios openbios.bin` on the command line.
+
+Download (`524288` bytes, SHA512 in a `.sha512` companion file):
+
+- **Working mirror (MIT):**
+  `https://mirrors.mit.edu/libreboot/canoeboot/old_releases/20250107/roms/playstation/openbios.bin`
+- *Libreboot mirrorservice was 404 last we checked — use the MIT URL.*
+- Alternative: build it yourself from the
+  [pcsx-redux source tree](https://github.com/grumpycoders/pcsx-redux/tree/main/src/mips/openbios).
+
+Other PS1 BIOS images (real-hardware dumps, e.g. `scph1001.bin`) work
+too if you already own one — but redistribution of those is not
+licensed, so we don't link them.
 
 ## What's in the box
 
@@ -22,8 +56,8 @@ After unzipping `ps1-vj-mix-windows-x64.zip`:
 
 ## Quick start (1 emulator + mixer)
 
-1. **Run pcsx-redux** (`pcsx-redux.main.exe` from the v0.7.0 fork ZIP).
-   Use `-bios <bios> -iso <game.bin/cue> -run` to start a game directly.
+1. **Run pcsx-redux** (`pcsx-redux.exe` from the v0.7.x fork ZIP).
+   Use `-bios openbios.bin -iso <game.cue> -run` to start a game directly.
 2. In pcsx-redux: **Debug → GPU → "Show VJ live IPC"**. Leave the
    ring name as the default `Local\vj-mix-prim-A`. Click **Start live**.
 3. **Run `vj-mix-spike1.exe`**. The Controls window opens.
@@ -86,9 +120,18 @@ in the mixer via the **Open** button in the file section. Useful for:
   splash). Wait a few seconds.
 - **Garbled textures with both channels.** Push the VRAM relocate slider
   to 512 (Phase C clean mode) — Phase B chaos is the default.
-- **CLUT 4/8bpp sprites look wrong / missing.** Known limitation — the
-  current renderer samples VRAM as 15bpp direct-colour. M5 / future
-  milestones plan CLUT support.
+- **CLUT 4/8bpp sprites look wrong / missing.** Pick the right
+  **CLUT mode** in the mixer Controls panel:
+  - *Direct sample* — legacy "VJ" mode, CLUT prims look broken on purpose.
+  - *Discard CLUT* — silhouette only.
+  - *Noise CLUT* — replaces CLUT sprites with per-prim hash colours.
+  - *Clean CLUT (proper palette lookup)* — actually decodes the
+    palette and shows the game's real graphics. **Requires
+    pcsx-redux fork v0.7.1+** (the fork has to send TPage + CLUT in
+    `hostTag`); with v0.7.0 you'll get a black screen in Clean mode.
+- **Clean mode flickers.** Live IPC ring drops under heavy traffic.
+  Make sure you're on **pcsx-redux fork v0.7.2+** (default ring
+  bumped from 2 MB to 8 MB).
 
 ## Selftest
 
