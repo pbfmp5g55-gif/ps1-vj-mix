@@ -72,3 +72,16 @@ add_executable(vj-mix-spike1
 )
 target_link_libraries(vj-mix-spike1 PRIVATE vj imgui)
 target_include_directories(vj-mix-spike1 PRIVATE src)
+
+# ---------------------------------------------------------------------------
+# IPC ring (Windows shared-memory SPSC). POSIX impl deferred.
+# ---------------------------------------------------------------------------
+add_library(vj_ipc_ring STATIC
+    src/mixer/ipc/ipc_ring.cpp
+)
+target_include_directories(vj_ipc_ring PUBLIC src)
+
+add_executable(vj-mix-ipc-selftest
+    src/mixer/ipc/selftest.cpp
+)
+target_link_libraries(vj-mix-ipc-selftest PRIVATE vj_ipc_ring)
