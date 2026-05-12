@@ -788,7 +788,15 @@ int main() {
     std::strncpy(chA.nameBuf, "Local\\vj-mix-prim-A", sizeof(chA.nameBuf));
     std::strncpy(chB.nameBuf, "Local\\vj-mix-prim-B", sizeof(chB.nameBuf));
     std::vector<uint8_t> liveRecBuf;
-    liveRecBuf.resize(64 * 1024);
+    // 2 MB receive buffer — fits a full 1024x512 VRAM snapshot (which
+    // pcsx-redux v0.7.4+ sends on live::start as up to four 1024x128
+    // VRAMUpload records, ~262 KB each). The previous 64 KB cap silently
+    // dropped any such record (readRecord sets outLen to the real size
+    // and drainChannel skips records where len > buffer size), so the
+    // mixer's VRAM mirror never saw the initial palette state and Clean
+    // CLUT mode came up blank for games whose palette is uploaded once
+    // (Quake, Nekketsu, etc.).
+    liveRecBuf.resize(2 * 1024 * 1024);
 
     // Phase B crossfader: 0 = 100% A, 1 = 100% B. Sources at the midpoint
     // each keep half their primitives via the random gate below.
