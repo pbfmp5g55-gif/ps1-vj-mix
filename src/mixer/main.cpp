@@ -262,6 +262,13 @@ void main() {
         frag_color = vec4(col, 1.0);
         return;
     }
+    if (u_clut_mode == 4) {
+        // Shape only: ignore palette / texture, render the polygon with the
+        // game's gouraud-shaded vertex colour. Works no matter what state
+        // the VRAM mirror is in — palette desync never blacks out the prim.
+        frag_color = vec4(v_color.rgb, 1.0);
+        return;
+    }
     if (u_clut_mode == 0) {
         // Legacy Direct: read VRAM at PSX-texel offset (which is wrong for
         // 4/8bpp — that's the point: it produces the "garbage" look).
@@ -820,8 +827,10 @@ int main() {
         if (!midi || !midiOverrideEnabled) return;
         const int c = midi->getCC(clutModeCC);
         if (c >= 0) {
-            int m = c / 32;            // 0..31 -> 0 ... 96..127 -> 3
-            if (m > 3) m = 3;          // 127/32 == 3, but guard anyway
+            // 5 CLUT modes: 0..127 -> 0..4 in 5 even bands (~26 CC values
+            // each). Mode 0=Direct 1=Discard 2=Noise 3=Clean 4=ShapeOnly.
+            int m = (c * 5) / 128;
+            if (m > 4) m = 4;
             renderer.clutMode = m;
         }
         const int x = midi->getCC(crossfadeCC);
@@ -1029,9 +1038,10 @@ int main() {
                 "Direct sample (CLUT looks black)",
                 "Discard CLUT (silhouette)",
                 "Noise CLUT (per-prim hash color)",
-                "Clean CLUT (proper palette lookup)"
+                "Clean CLUT (proper palette lookup)",
+                "Shape only (vertex color, ignore palette)"
             };
-            ImGui::Combo("CLUT mode", &renderer.clutMode, clutModes, 4);
+            ImGui::Combo("CLUT mode", &renderer.clutMode, clutModes, 5);
             ImGui::Text("Last frame: direct=%d  4bpp=%d  8bpp=%d",
                         renderer.statDirectPrims,
                         renderer.stat4bppPrims,
@@ -1315,7 +1325,7 @@ int main() {
             bindingRow("Twin delay frames",  &twinDelayCC,  1, "(maps 0..127 -> 1..300)");
             bindingRow("Twin ghost bright",  &twinAlphaCC,  2, "(maps 0..127 -> 0..1)");
             ImGui::TextUnformatted("Phase B / C CC bindings:");
-            bindingRow("CLUT mode",          &clutModeCC,   3, "(0..31=Dir,32..63=Disc,64..95=Noi,96..127=Cln)");
+            bindingRow("CLUT mode",          &clutModeCC,   3, "(5 bands: Direct/Discard/Noise/Clean/Shape)");
             bindingRow("Crossfade A<->B",    &crossfadeCC,  4, "(0..127 -> 0..1)");
             bindingRow("B VRAM relocate",    &relocateCC,   5, "(0..127 -> 0..512, B chaos vs C clean)");
 
