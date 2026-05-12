@@ -736,7 +736,9 @@ int main() {
     int    twinDelayFrames = 60;  // ~1 second at 60 fps
     float  twinAlpha = 0.5f;      // colour-mul factor for the ghost
 
-    // Live IPC mode: two channels A and B for Phase B mixing.
+    // Live IPC mode: two channels A and B for Phase B mixing. history holds
+    // the last few hundred frames so Twin Self / echo effects can overlay a
+    // delayed copy of the live stream.
     struct LiveChannel {
         char                 nameBuf[128];
         vjmix::IpcRingReader reader;
@@ -744,6 +746,7 @@ int main() {
         vj::EchoFrame        latest;
         bool                 hasFrame = false;
         int                  framesSeen = 0;
+        vj::PrimitiveRingbuffer history{300};  // 5 s at 60 fps
     };
     LiveChannel chA, chB;
     std::strncpy(chA.nameBuf, "Local\\vj-mix-prim-A", sizeof(chA.nameBuf));
@@ -824,6 +827,11 @@ int main() {
                     ch.building.uploads.clear();
                     ch.hasFrame = true;
                     ++ch.framesSeen;
+                    // Push into history for Twin Self / live echo overlay.
+                    ch.history.beginFrame(ch.latest.frameIndex);
+                    for (const auto& p : ch.latest.primitives) {
+                        ch.history.recordPrimitive(p);
+                    }
                 }
             }
         };
@@ -954,16 +962,24 @@ int main() {
                 ImGui::Text("Primitives:        %zu", fr.primitives.size());
                 ImGui::Text("VRAM uploads:      %zu", fr.uploads.size());
                 ImGui::Text("Drawn (total):     %d", lastDrawn);
-
-                ImGui::Separator();
-                ImGui::Checkbox("Twin Self (overlay past frame)", &twinEnabled);
-                if (twinEnabled) {
-                    ImGui::SliderInt("Delay frames", &twinDelayFrames, 1, 300);
-                    ImGui::Text("Delay: %.2f s (at 60 fps)", twinDelayFrames / 60.0f);
-                    ImGui::SliderFloat("Ghost brightness", &twinAlpha, 0.0f, 1.0f, "%.2f");
-                }
             } else {
                 ImGui::TextDisabled("(open a .vjr file)");
+            }
+
+            // Twin Self works against either a loaded file or a live channel's
+            // history ringbuffer, so the UI is shown unconditionally.
+            ImGui::Separator();
+            ImGui::Checkbox("Twin Self (overlay past frame)", &twinEnabled);
+            if (twinEnabled) {
+                ImGui::SliderInt("Delay frames", &twinDelayFrames, 1, 300);
+                ImGui::Text("Delay: %.2f s (at 60 fps)", twinDelayFrames / 60.0f);
+                ImGui::SliderFloat("Ghost brightness", &twinAlpha, 0.0f, 1.0f, "%.2f");
+                const bool anyAttached = chA.reader.isOpen() || chB.reader.isOpen();
+                if (anyAttached) {
+                    ImGui::TextDisabled("Live history: A=%d frames, B=%d frames",
+                                        chA.history.sizeFrames(),
+                                        chB.history.sizeFrames());
+                }
             }
         }
         ImGui::End();
@@ -1002,6 +1018,19 @@ int main() {
                     if (!ch.hasFrame) return;
                     renderer.applyUploads(ch.latest.uploads,
                                           static_cast<int>(xRelocate));
+                    // Twin Self ghost: draw delayed history first, dimmed, so
+                    // the live frame paints over it.
+                    if (twinEnabled && keepProb > 0.0f) {
+                        const vj::EchoFrame* gh =
+                            ch.history.getDelayed(twinDelayFrames);
+                        if (gh && !gh->primitives.empty()) {
+                            renderer.drawUntextured(gh->primitives,
+                                                    vpX, vpY, vpW, vpH, twinAlpha);
+                            renderer.drawTextured(gh->primitives,
+                                                  vpX, vpY, vpW, vpH,
+                                                  twinAlpha, xRelocate);
+                        }
+                    }
                     if (keepProb <= 0.0f) return;
                     std::vector<vj::Primitive> kept;
                     kept.reserve(ch.latest.primitives.size());
