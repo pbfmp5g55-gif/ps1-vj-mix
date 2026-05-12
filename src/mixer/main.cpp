@@ -13,6 +13,7 @@
 #include "imgui_impl_opengl3.h"
 
 #include "mixer/gl_loader.h"
+#include "mixer/ipc/ipc_ring.h"
 #include "vj/PrimitiveStream.h"
 
 #include <GLFW/glfw3.h>
@@ -28,6 +29,49 @@ constexpr int kPS1Width  = 320;
 constexpr int kPS1Height = 240;
 constexpr int kVRAMWidth  = 1024;
 constexpr int kVRAMHeight = 512;
+
+// Unpack the on-wire Primitive layout (matches packPrimitiveForLive in
+// the pcsx-redux fork: kind/textured/vc/blend + 8-byte hostTag + N*20).
+bool unpackLivePrimitive(const uint8_t* buf, size_t len, vj::Primitive& p) {
+    if (len < 12) return false;
+    p.kind     = static_cast<vj::PrimitiveKind>(buf[0]);
+    p.textured = buf[1] != 0;
+    const uint8_t vc = buf[2];
+    p.blendMode = static_cast<vj::BlendMode>(buf[3]);
+    std::memcpy(&p.hostTag, buf + 4, 8);
+    const size_t need = 12 + static_cast<size_t>(vc) * 20;
+    if (len < need) return false;
+    p.vertices.resize(vc);
+    size_t off = 12;
+    for (uint8_t i = 0; i < vc; ++i) {
+        auto& v = p.vertices[i];
+        std::memcpy(&v.x, buf + off, 4); off += 4;
+        std::memcpy(&v.y, buf + off, 4); off += 4;
+        std::memcpy(&v.u, buf + off, 4); off += 4;
+        std::memcpy(&v.v, buf + off, 4); off += 4;
+        v.r = buf[off++];
+        v.g = buf[off++];
+        v.b = buf[off++];
+        v.a = buf[off++];
+    }
+    return true;
+}
+
+bool unpackLiveUpload(const uint8_t* buf, size_t len, vj::VRAMUpload& u) {
+    if (len < 8) return false;
+    uint16_t x = 0, y = 0, w = 0, h = 0;
+    std::memcpy(&x, buf + 0, 2);
+    std::memcpy(&y, buf + 2, 2);
+    std::memcpy(&w, buf + 4, 2);
+    std::memcpy(&h, buf + 6, 2);
+    u.x = x; u.y = y; u.w = w; u.h = h;
+    const size_t pixels = static_cast<size_t>(w) * h;
+    const size_t need   = 8 + pixels * 2;
+    if (len < need) return false;
+    u.data.resize(pixels);
+    if (pixels > 0) std::memcpy(u.data.data(), buf + 8, pixels * 2);
+    return true;
+}
 
 // Convert PS1 5/5/5/mask 16bpp to RGBA8 (we ignore the mask bit; black
 // stays black, which the textured shader maps to transparent via alpha=0).
@@ -524,6 +568,16 @@ int main() {
     int    twinDelayFrames = 60;  // ~1 second at 60 fps
     float  twinAlpha = 0.5f;      // colour-mul factor for the ghost
 
+    // Live IPC mode: attach to a pcsx-redux fork's shared-memory ring.
+    char                 liveNameBuf[128] = "Local\\vj-mix-prim-A";
+    vjmix::IpcRingReader liveReader;
+    vj::EchoFrame        liveBuilding;   // accumulates records until FrameEnd
+    vj::EchoFrame        liveLatest;     // the most-recently-completed frame
+    bool                 liveHasFrame = false;
+    int                  liveFramesSeen = 0;
+    std::vector<uint8_t> liveRecBuf;     // scratch
+    liveRecBuf.resize(64 * 1024);
+
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
 
@@ -539,13 +593,78 @@ int main() {
             }
         }
 
+        // Drain the live ring; commit a frame each time a FrameEnd arrives.
+        if (liveReader.isOpen()) {
+            for (int safety = 0; safety < 50000; ++safety) {
+                vjmix::IpcRecordType type;
+                size_t len = 0;
+                if (!liveReader.readRecord(type, liveRecBuf.data(),
+                                           liveRecBuf.size(), len)) {
+                    break;
+                }
+                if (len > liveRecBuf.size()) continue;  // truncated; skip
+                if (type == vjmix::IpcRecordType::Primitive) {
+                    vj::Primitive p;
+                    if (unpackLivePrimitive(liveRecBuf.data(), len, p)) {
+                        liveBuilding.primitives.push_back(std::move(p));
+                    }
+                } else if (type == vjmix::IpcRecordType::VRAMUpload) {
+                    vj::VRAMUpload u;
+                    if (unpackLiveUpload(liveRecBuf.data(), len, u)) {
+                        liveBuilding.uploads.push_back(std::move(u));
+                    }
+                } else if (type == vjmix::IpcRecordType::FrameEnd) {
+                    uint32_t fi = 0;
+                    if (len >= 4) std::memcpy(&fi, liveRecBuf.data(), 4);
+                    liveBuilding.frameIndex = static_cast<int>(fi);
+                    liveLatest = std::move(liveBuilding);
+                    liveBuilding.primitives.clear();
+                    liveBuilding.uploads.clear();
+                    liveHasFrame = true;
+                    ++liveFramesSeen;
+                }
+            }
+        }
+
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
 
         if (ImGui::Begin("Controls")) {
-            ImGui::TextDisabled("M3: untextured polygon rendering");
+            // Live IPC section first — when active, it overrides the file
+            // source.
+            ImGui::TextUnformatted("Live IPC (shared-memory ring):");
+            ImGui::SetNextItemWidth(-160);
+            ImGui::InputText("##liveName", liveNameBuf, sizeof(liveNameBuf),
+                             liveReader.isOpen() ? ImGuiInputTextFlags_ReadOnly : 0);
+            ImGui::SameLine();
+            if (liveReader.isOpen()) {
+                if (ImGui::Button("Detach")) {
+                    liveReader.close();
+                    liveBuilding = vj::EchoFrame{};
+                    liveLatest   = vj::EchoFrame{};
+                    liveHasFrame = false;
+                    liveFramesSeen = 0;
+                }
+            } else {
+                if (ImGui::Button("Attach")) {
+                    if (!liveReader.open(liveNameBuf)) {
+                        std::fprintf(stderr,
+                                     "[mixer] live attach failed for %s\n",
+                                     liveNameBuf);
+                    }
+                }
+            }
+            if (liveReader.isOpen()) {
+                ImGui::Text("Live: ATTACHED, %d frames received", liveFramesSeen);
+                ImGui::Text("Dropped by writer: %u", liveReader.droppedCount());
+                ImGui::Text("Writer heartbeat:  %u", liveReader.writerHeartbeat());
+            } else {
+                ImGui::TextDisabled("Live: idle (Attach to a pcsx-redux ring)");
+            }
             ImGui::Separator();
+
+            ImGui::TextDisabled("Recorded .vjr file:");
 
             ImGui::SetNextItemWidth(-180);
             ImGui::InputText("##path", pathBuf, sizeof(pathBuf));
@@ -612,7 +731,9 @@ int main() {
         glClearColor(0.02f, 0.02f, 0.04f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
 
-        if (!recording.frames.empty() && renderer.program) {
+        const bool haveSource = (liveReader.isOpen() && liveHasFrame) ||
+                                !recording.frames.empty();
+        if (haveSource && renderer.program) {
             const float aspectPSX = static_cast<float>(kPS1Width) /
                                     static_cast<float>(kPS1Height);
             int vpW = displayW;
@@ -624,14 +745,20 @@ int main() {
             const int vpX = (displayW - vpW) / 2;
             const int vpY = (displayH - vpH) / 2;
 
-            // Apply VRAM uploads from the current frame BEFORE any draws.
-            const auto& fr =
-                recording.frames[static_cast<size_t>(currentFrame)];
+            // Choose source: live (if attached & has a frame) > file.
+            const vj::EchoFrame* frPtr = nullptr;
+            if (liveReader.isOpen() && liveHasFrame) {
+                frPtr = &liveLatest;
+            } else if (!recording.frames.empty()) {
+                frPtr = &recording.frames[static_cast<size_t>(currentFrame)];
+            }
+            const vj::EchoFrame& fr = *frPtr;
+
             renderer.applyUploads(fr.uploads);
 
-            // Draw the ghost (past frame) first so the live frame overdraws
-            // it. Wraps around for files shorter than the requested delay.
-            if (twinEnabled) {
+            // Twin Self only on file mode for now (ringbuffer would need a
+            // history of live frames; current S2.3 ships without).
+            if (twinEnabled && !liveReader.isOpen() && !recording.frames.empty()) {
                 const int n = static_cast<int>(recording.frames.size());
                 int ghostFrame = currentFrame - twinDelayFrames;
                 while (ghostFrame < 0) ghostFrame += n;

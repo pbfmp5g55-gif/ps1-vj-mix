@@ -70,7 +70,7 @@ add_executable(vj-mix-spike1
     src/mixer/main.cpp
     src/mixer/gl_loader.cpp
 )
-target_link_libraries(vj-mix-spike1 PRIVATE vj imgui)
+target_link_libraries(vj-mix-spike1 PRIVATE vj imgui vj_ipc_ring)
 target_include_directories(vj-mix-spike1 PRIVATE src)
 
 # ---------------------------------------------------------------------------
