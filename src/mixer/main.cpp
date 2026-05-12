@@ -15,6 +15,8 @@
 
 #include "mixer/gl_loader.h"
 #include "mixer/ipc/ipc_ring.h"
+#include "vj/AutoMode.h"
+#include "vj/FilterPresetBank.h"
 #include "vj/Params.h"
 #include "vj/PrimitiveInterceptor.h"
 #include "vj/PrimitiveStream.h"
@@ -812,6 +814,33 @@ int main() {
     });
     int vjFrameCounter = 0;
 
+    // Filter Preset Bank — 16 slots of FilterParams selectable via a single
+    // MIDI CC. Saved/loaded as a .vjbank file alongside the exe.
+    vj::FilterPresetBank presetBank;
+    int  filterPresetCC        = 16;     // default CC for preset select
+    bool filterMidiEnabled     = false;
+    bool filterInterpolation   = true;
+    int  filterEditingSlot     = 0;
+    bool filterLearnArmed      = false;
+    int  filterLearnSeenCC     = -1;
+    char filterBankPath[256]   = "mixer-filter-bank.vjbank";
+    char filterBankStatus[64]  = "";
+
+    // AutoMode — sinewave LFOs that modulate the 8 effect axes on top of the
+    // base values from the sliders. Pure function in libvj.
+    vj::AutoModeParams autoMode;  // enabled=false by default
+
+    // Extend applyMidiOverrides to also drive the filter preset CC when
+    // Filter MIDI is on.
+    auto applyFilterMidi = [&]() {
+        if (!midi || !filterMidiEnabled) return;
+        const int v = midi->getCC(filterPresetCC);
+        if (v < 0) return;
+        vjEffectParams.filter = filterInterpolation
+            ? presetBank.selectInterpolated(v)
+            : presetBank.selectSnap(v);
+    };
+
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
 
@@ -819,6 +848,7 @@ int main() {
         // UI / draw code reads them this frame. Manual UI edits made later
         // in the same frame override these.
         applyMidiOverrides();
+        applyFilterMidi();
 
         const double now = glfwGetTime();
         const double dt  = now - lastTickTime;
@@ -949,6 +979,132 @@ int main() {
                 ImGui::SliderFloat("CHAOS",    &vjEffectParams.chaos,    0.0f, 1.0f, "%.2f");
                 if (ImGui::Button("Reset effects")) vjEffectParams = vj::Params{};
             }
+
+            // ---------------------------------------------------------------
+            // AutoMode: drive the 8 effect axes by sine LFOs.
+            // ---------------------------------------------------------------
+            if (ImGui::CollapsingHeader("AutoMode (LFO-driven effect axes)")) {
+                ImGui::Checkbox("AutoMode enabled", &autoMode.enabled);
+                ImGui::SliderFloat("LFO depth", &autoMode.depth, 0.0f, 1.0f, "%.2f");
+                ImGui::SliderFloat("LFO rate",  &autoMode.rate,  0.05f, 4.0f, "%.2fx");
+                ImGui::TextDisabled("(modulates on top of the slider values above)");
+            }
+
+            // ---------------------------------------------------------------
+            // Filter Preset Bank: 16 named slots of FilterParams, optionally
+            // selected by a single MIDI CC (interpolated or snap mode).
+            // ---------------------------------------------------------------
+            if (ImGui::CollapsingHeader("Filter Preset Bank")) {
+                // Save / Load row.
+                ImGui::SetNextItemWidth(220);
+                ImGui::InputText("Bank file", filterBankPath, sizeof(filterBankPath));
+                if (ImGui::Button("Save bank")) {
+                    const bool ok = presetBank.saveTo(filterBankPath);
+                    std::snprintf(filterBankStatus, sizeof(filterBankStatus),
+                                  "Save: %s", ok ? "OK" : "FAILED");
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Reload bank")) {
+                    const bool ok = presetBank.loadFrom(filterBankPath);
+                    std::snprintf(filterBankStatus, sizeof(filterBankStatus),
+                                  "Load: %s", ok ? "OK" : "FAILED");
+                }
+                if (filterBankStatus[0]) {
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("%s", filterBankStatus);
+                }
+
+                ImGui::Separator();
+                ImGui::Checkbox("Filter MIDI enabled", &filterMidiEnabled);
+                ImGui::SameLine();
+                ImGui::Checkbox("Interpolate", &filterInterpolation);
+
+                if (filterLearnArmed && midi) {
+                    const int latest = midi->lastReceivedCC();
+                    if (latest >= 0 && latest != filterLearnSeenCC) {
+                        filterPresetCC = latest;
+                        filterLearnArmed = false;
+                    }
+                }
+                ImGui::SetNextItemWidth(90);
+                if (ImGui::InputInt("Preset CC", &filterPresetCC, 1, 8)) {
+                    if (filterPresetCC < 0) filterPresetCC = 0;
+                    if (filterPresetCC > 127) filterPresetCC = 127;
+                }
+                ImGui::SameLine();
+                if (filterLearnArmed) {
+                    if (ImGui::Button("Cancel##bank")) filterLearnArmed = false;
+                } else {
+                    if (ImGui::Button("Learn##bank")) {
+                        filterLearnArmed = true;
+                        filterLearnSeenCC = midi ? midi->lastReceivedCC() : -1;
+                    }
+                }
+                ImGui::SameLine();
+                const int liveCC = midi ? midi->getCC(filterPresetCC) : -1;
+                char vbuf[32];
+                if (liveCC < 0) std::snprintf(vbuf, sizeof(vbuf), "--");
+                else            std::snprintf(vbuf, sizeof(vbuf), "%d", liveCC);
+                ImGui::ProgressBar(liveCC < 0 ? 0.0f
+                                              : static_cast<float>(liveCC) / 127.0f,
+                                   ImVec2(130, 0), vbuf);
+                if (liveCC >= 0) {
+                    const int s = vj::FilterPresetBank::slotForCC(liveCC);
+                    ImGui::TextDisabled("Hot slot: %d \"%s\"", s,
+                                        presetBank.slot(s).name.c_str());
+                }
+
+                ImGui::Separator();
+                ImGui::TextUnformatted("Slots (click to edit):");
+                if (ImGui::BeginChild("##slotlist", ImVec2(180, 220), true)) {
+                    for (int i = 0; i < vj::FilterPresetBank::slotCount(); ++i) {
+                        char label[64];
+                        std::snprintf(label, sizeof(label), "%2d  %s", i,
+                                      presetBank.slot(i).name.c_str());
+                        const bool sel = filterEditingSlot == i;
+                        if (ImGui::Selectable(label, sel)) filterEditingSlot = i;
+                    }
+                }
+                ImGui::EndChild();
+                ImGui::SameLine();
+                ImGui::BeginGroup();
+                {
+                    auto& slot = presetBank.slot(filterEditingSlot);
+                    ImGui::Text("Editing slot %d", filterEditingSlot);
+                    char nameBuf[64];
+                    std::snprintf(nameBuf, sizeof(nameBuf), "%s", slot.name.c_str());
+                    if (ImGui::InputText("Name", nameBuf, sizeof(nameBuf))) {
+                        slot.name = nameBuf;
+                    }
+                    ImGui::Checkbox("Textured only", &slot.params.texturedOnly);
+                    ImGui::SliderFloat("Min area", &slot.params.minArea, 0.0f, 50000.0f, "%.0f");
+                    ImGui::SliderFloat("Max area", &slot.params.maxArea, 0.0f, 50000.0f, "%.0f");
+                    float region[4] = {
+                        slot.params.regionX0, slot.params.regionY0,
+                        slot.params.regionX1, slot.params.regionY1,
+                    };
+                    if (ImGui::SliderFloat4("Region", region, 0.0f, 1024.0f, "%.0f")) {
+                        slot.params.regionX0 = region[0];
+                        slot.params.regionY0 = region[1];
+                        slot.params.regionX1 = region[2];
+                        slot.params.regionY1 = region[3];
+                    }
+                    ImGui::SliderInt("Every N", &slot.params.everyN, 0, 16);
+
+                    if (ImGui::Button("Capture live -> slot")) {
+                        slot.params = vjEffectParams.filter;
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Button("Apply slot -> live")) {
+                        vjEffectParams.filter = slot.params;
+                    }
+                    if (ImGui::Button("Clear slot")) {
+                        slot.params = vj::FilterParams{};
+                    }
+                }
+                ImGui::EndGroup();
+            }
+
             ImGui::Separator();
 
             ImGui::TextDisabled("Recorded .vjr file:");
@@ -1163,7 +1319,10 @@ int main() {
                     const std::vector<vj::Primitive>* drawn = &kept;
                     if (vjEffectsEnabled) {
                         vjPassThruScratch.clear();
-                        vjInterceptor.beginFrame(vjEffectParams, vjFrameCounter);
+                        const vj::Params effective = autoMode.enabled
+                            ? vj::applyAutoMode(vjEffectParams, autoMode, vjFrameCounter)
+                            : vjEffectParams;
+                        vjInterceptor.beginFrame(effective, vjFrameCounter);
                         for (auto& p : kept) vjInterceptor.interceptAndSubmit(p);
                         drawn = &vjPassThruScratch;
                     }
