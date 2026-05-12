@@ -286,39 +286,28 @@ struct Renderer {
         push(c);
     }
 
-    int drawUntextured(const std::vector<vj::Primitive>& prims,
-                       int viewportX, int viewportY,
-                       int viewportW, int viewportH,
-                       float colorMul = 1.0f) {
-        verts.clear();
-        int drawn = 0;
-        for (const auto& p : prims) {
-            if (p.textured) continue;
-            auto pushDim = [&](const vj::Vertex& a, const vj::Vertex& b,
-                               const vj::Vertex& c) {
-                auto push = [&](const vj::Vertex& v) {
-                    verts.push_back(v.x);
-                    verts.push_back(v.y);
-                    verts.push_back((v.r / 255.0f) * colorMul);
-                    verts.push_back((v.g / 255.0f) * colorMul);
-                    verts.push_back((v.b / 255.0f) * colorMul);
-                    verts.push_back(v.a / 255.0f);
-                };
-                push(a); push(b); push(c);
-            };
-            if (p.kind == vj::PrimitiveKind::Triangle &&
-                p.vertices.size() >= 3) {
-                pushDim(p.vertices[0], p.vertices[1], p.vertices[2]);
-                ++drawn;
-            } else if (p.kind == vj::PrimitiveKind::Quad &&
-                       p.vertices.size() >= 4) {
-                pushDim(p.vertices[0], p.vertices[1], p.vertices[2]);
-                pushDim(p.vertices[1], p.vertices[3], p.vertices[2]);
-                ++drawn;
-            }
-        }
-        if (verts.empty()) return drawn;
+    // Pack one triangle into `out` using the untextured (6 floats per vtx)
+    // layout. Optional colorMul for the Twin Self ghost.
+    static void pushTriUntex(std::vector<float>& out,
+                             const vj::Vertex& a, const vj::Vertex& b,
+                             const vj::Vertex& c, float colorMul) {
+        auto push = [&](const vj::Vertex& v) {
+            out.push_back(v.x);
+            out.push_back(v.y);
+            out.push_back((v.r / 255.0f) * colorMul);
+            out.push_back((v.g / 255.0f) * colorMul);
+            out.push_back((v.b / 255.0f) * colorMul);
+            // For semi-transparent prims the fragment shader uses this
+            // alpha for blending; opaque prims ignore it.
+            out.push_back(v.a / 255.0f);
+        };
+        push(a); push(b); push(c);
+    }
 
+    // Submit a buffer of untextured triangles to the GPU.
+    void submitUntex(const std::vector<float>& buf, int viewportX, int viewportY,
+                     int viewportW, int viewportH) {
+        if (buf.empty()) return;
         glViewport(viewportX, viewportY, viewportW, viewportH);
         vjgl_UseProgram(program);
         vjgl_Uniform2f(uPsxSize, static_cast<float>(kPS1Width),
@@ -326,56 +315,80 @@ struct Renderer {
         vjgl_BindVertexArray(vao);
         vjgl_BindBuffer(GL_ARRAY_BUFFER, vbo);
         vjgl_BufferData(GL_ARRAY_BUFFER,
-                        static_cast<GLsizeiptr_compat>(verts.size() * sizeof(float)),
-                        verts.data(), GL_DYNAMIC_DRAW);
-        glDrawArrays(GL_TRIANGLES, 0,
-                     static_cast<GLsizei>(verts.size() / 6));
+                        static_cast<GLsizeiptr_compat>(buf.size() * sizeof(float)),
+                        buf.data(), GL_DYNAMIC_DRAW);
+        glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(buf.size() / 6));
         vjgl_BindVertexArray(0);
-        return drawn;
     }
 
-    int drawTextured(const std::vector<vj::Primitive>& prims,
-                     int viewportX, int viewportY,
-                     int viewportW, int viewportH,
-                     float colorMul = 1.0f) {
-        texVerts.clear();
+    // Scratch buffers per blend bucket (Opaque + SemiTransparent).
+    std::vector<float> vertsSemi;
+
+    int drawUntextured(const std::vector<vj::Primitive>& prims,
+                       int viewportX, int viewportY,
+                       int viewportW, int viewportH,
+                       float colorMul = 1.0f) {
+        verts.clear();
+        vertsSemi.clear();
         int drawn = 0;
         for (const auto& p : prims) {
-            if (!p.textured) continue;
-            // hostTag layout (from upstream HOOKS.md):
-            //   tpage.raw[bits 24..39] | twindow[20..23] | clut[16..23 etc] | shape_tag[0..2]
-            // PS1 TPage encoding (within tpage.raw bits 0..15):
-            //   TX (4)  = base X / 64  (so TPageBaseX = TX * 64)
-            //   TY (1)  = base Y / 256 (so TPageBaseY = TY * 256)
-            //   TP (2)  = bpp mode (0=4bpp, 1=8bpp, 2=15bpp)
-            const uint64_t tpageRaw = (p.hostTag >> 24) & 0xFFFF;
-            const float TPageBaseX = static_cast<float>((tpageRaw & 0xF) * 64);
-            const float TPageBaseY = static_cast<float>(((tpageRaw >> 4) & 0x1) * 256);
-            auto pushVtx = [&](const vj::Vertex& v) {
-                texVerts.push_back(v.x);
-                texVerts.push_back(v.y);
-                texVerts.push_back(TPageBaseX + v.u);
-                texVerts.push_back(TPageBaseY + v.v);
-                texVerts.push_back((v.r / 255.0f) * colorMul);
-                texVerts.push_back((v.g / 255.0f) * colorMul);
-                texVerts.push_back((v.b / 255.0f) * colorMul);
-                texVerts.push_back(v.a / 255.0f);
-            };
-            auto pushTriV = [&](const vj::Vertex& a, const vj::Vertex& b,
-                                const vj::Vertex& c) {
-                pushVtx(a); pushVtx(b); pushVtx(c);
-            };
-            if (p.kind == vj::PrimitiveKind::Triangle && p.vertices.size() >= 3) {
-                pushTriV(p.vertices[0], p.vertices[1], p.vertices[2]);
+            if (p.textured) continue;
+            std::vector<float>& bucket =
+                (p.blendMode == vj::BlendMode::Opaque) ? verts : vertsSemi;
+            if (p.kind == vj::PrimitiveKind::Triangle &&
+                p.vertices.size() >= 3) {
+                pushTriUntex(bucket, p.vertices[0], p.vertices[1],
+                             p.vertices[2], colorMul);
                 ++drawn;
-            } else if (p.kind == vj::PrimitiveKind::Quad && p.vertices.size() >= 4) {
-                pushTriV(p.vertices[0], p.vertices[1], p.vertices[2]);
-                pushTriV(p.vertices[1], p.vertices[3], p.vertices[2]);
+            } else if (p.kind == vj::PrimitiveKind::Quad &&
+                       p.vertices.size() >= 4) {
+                pushTriUntex(bucket, p.vertices[0], p.vertices[1],
+                             p.vertices[2], colorMul);
+                pushTriUntex(bucket, p.vertices[1], p.vertices[3],
+                             p.vertices[2], colorMul);
                 ++drawn;
             }
         }
-        if (texVerts.empty()) return drawn;
+        // Opaque pass first.
+        glDisable(GL_BLEND);
+        submitUntex(verts, viewportX, viewportY, viewportW, viewportH);
+        // Semi-transparent pass. PS1 Average mode = (B + F) / 2; emulate
+        // by drawing F with alpha 0.5 over B. The fragment colour
+        // already carries vertex alpha; we just need the right blend
+        // function and a forced alpha of 0.5.
+        if (!vertsSemi.empty()) {
+            for (size_t i = 5; i < vertsSemi.size(); i += 6) {
+                vertsSemi[i] = 0.5f;
+            }
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            submitUntex(vertsSemi, viewportX, viewportY, viewportW, viewportH);
+            glDisable(GL_BLEND);
+        }
+        return drawn;
+    }
 
+    static void pushTriTex(std::vector<float>& out,
+                           const vj::Vertex& a, const vj::Vertex& b,
+                           const vj::Vertex& c,
+                           float TPageBaseX, float TPageBaseY,
+                           float colorMul) {
+        auto push = [&](const vj::Vertex& v) {
+            out.push_back(v.x);
+            out.push_back(v.y);
+            out.push_back(TPageBaseX + v.u);
+            out.push_back(TPageBaseY + v.v);
+            out.push_back((v.r / 255.0f) * colorMul);
+            out.push_back((v.g / 255.0f) * colorMul);
+            out.push_back((v.b / 255.0f) * colorMul);
+            out.push_back(v.a / 255.0f);
+        };
+        push(a); push(b); push(c);
+    }
+
+    void submitTex(const std::vector<float>& buf, int viewportX, int viewportY,
+                   int viewportW, int viewportH) {
+        if (buf.empty()) return;
         glViewport(viewportX, viewportY, viewportW, viewportH);
         vjgl_UseProgram(texProgram);
         vjgl_Uniform2f(texUPsxSize, static_cast<float>(kPS1Width),
@@ -388,11 +401,52 @@ struct Renderer {
         vjgl_BindVertexArray(texVao);
         vjgl_BindBuffer(GL_ARRAY_BUFFER, texVbo);
         vjgl_BufferData(GL_ARRAY_BUFFER,
-                        static_cast<GLsizeiptr_compat>(texVerts.size() * sizeof(float)),
-                        texVerts.data(), GL_DYNAMIC_DRAW);
-        glDrawArrays(GL_TRIANGLES, 0,
-                     static_cast<GLsizei>(texVerts.size() / 8));
+                        static_cast<GLsizeiptr_compat>(buf.size() * sizeof(float)),
+                        buf.data(), GL_DYNAMIC_DRAW);
+        glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(buf.size() / 8));
         vjgl_BindVertexArray(0);
+    }
+
+    std::vector<float> texVertsSemi;
+
+    int drawTextured(const std::vector<vj::Primitive>& prims,
+                     int viewportX, int viewportY,
+                     int viewportW, int viewportH,
+                     float colorMul = 1.0f) {
+        texVerts.clear();
+        texVertsSemi.clear();
+        int drawn = 0;
+        for (const auto& p : prims) {
+            if (!p.textured) continue;
+            const uint64_t tpageRaw = (p.hostTag >> 24) & 0xFFFF;
+            const float TPageBaseX = static_cast<float>((tpageRaw & 0xF) * 64);
+            const float TPageBaseY = static_cast<float>(((tpageRaw >> 4) & 0x1) * 256);
+            std::vector<float>& bucket =
+                (p.blendMode == vj::BlendMode::Opaque) ? texVerts : texVertsSemi;
+            if (p.kind == vj::PrimitiveKind::Triangle && p.vertices.size() >= 3) {
+                pushTriTex(bucket, p.vertices[0], p.vertices[1], p.vertices[2],
+                           TPageBaseX, TPageBaseY, colorMul);
+                ++drawn;
+            } else if (p.kind == vj::PrimitiveKind::Quad && p.vertices.size() >= 4) {
+                pushTriTex(bucket, p.vertices[0], p.vertices[1], p.vertices[2],
+                           TPageBaseX, TPageBaseY, colorMul);
+                pushTriTex(bucket, p.vertices[1], p.vertices[3], p.vertices[2],
+                           TPageBaseX, TPageBaseY, colorMul);
+                ++drawn;
+            }
+        }
+        glDisable(GL_BLEND);
+        submitTex(texVerts, viewportX, viewportY, viewportW, viewportH);
+        if (!texVertsSemi.empty()) {
+            // Force alpha 0.5 on the semi-transparent bucket (PS1 Average).
+            for (size_t i = 7; i < texVertsSemi.size(); i += 8) {
+                texVertsSemi[i] = 0.5f;
+            }
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            submitTex(texVertsSemi, viewportX, viewportY, viewportW, viewportH);
+            glDisable(GL_BLEND);
+        }
         return drawn;
     }
 
