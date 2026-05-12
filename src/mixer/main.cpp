@@ -240,7 +240,9 @@ void main() {
         uint raw = texelFetch(u_vram, ivec2(tpx + psxU, tpy + psxV), 0).r;
         vec4 c = decodePSX(raw);
         if (c.a < 0.5) discard;
-        frag_color = c * v_color;
+        // PS1 modulation: vertex colour 0x80 means "unmodulated" (texture
+        // passes through), not 50%. Multiply by 2 and clamp so 0x80 → 1.0×.
+        frag_color = vec4(min(c.rgb * v_color.rgb * 2.0, vec3(1.0)), c.a * v_color.a);
         return;
     }
 
@@ -263,7 +265,8 @@ void main() {
         uint raw = texelFetch(u_vram, ivec2(tpx + psxU, tpy + psxV), 0).r;
         vec4 c = decodePSX(raw);
         if (c.a < 0.5) discard;
-        frag_color = c * v_color;
+        frag_color = vec4(min(c.rgb * v_color.rgb * 2.0, vec3(1.0)),
+                          c.a * v_color.a);
         return;
     }
 
@@ -287,7 +290,8 @@ void main() {
     uint pal = texelFetch(u_vram, ivec2(cx + int(idx), cy), 0).r;
     vec4 c = decodePSX(pal);
     if (c.a < 0.5) discard;
-    frag_color = c * v_color;
+    frag_color = vec4(min(c.rgb * v_color.rgb * 2.0, vec3(1.0)),
+                      c.a * v_color.a);
 }
 )";
 
