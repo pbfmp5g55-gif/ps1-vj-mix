@@ -822,6 +822,16 @@ int main() {
         if (r >= 0) relocateBX = static_cast<float>(r) / 127.0f * 512.0f;
     };
 
+    // VJ output preferences: hide the GUI + window chrome so the mixer
+    // window is a pure VJ surface. Hotkeys:
+    //   F1   toggle Controls panel + all ImGui windows
+    //   F11  toggle borderless fullscreen on the current monitor
+    bool showUI       = true;
+    bool borderless   = false;
+    bool prevF1Down   = false;
+    bool prevF11Down  = false;
+    int  saveWinX = 0, saveWinY = 0, saveWinW = 0, saveWinH = 0;
+
     // libvj effects on the mixed stream. The interceptor lives across frames
     // (its internal RandomController + DepthDelayQueue need persistence);
     // each frame we beginFrame with current params, push primitives through,
@@ -865,6 +875,36 @@ int main() {
 
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
+
+        // VJ hotkeys: F1 hides the GUI overlay, F11 toggles a borderless
+        // fullscreen window. Both edge-triggered (act on press, not hold).
+        {
+            const bool f1Now  = glfwGetKey(window, GLFW_KEY_F1)  == GLFW_PRESS;
+            const bool f11Now = glfwGetKey(window, GLFW_KEY_F11) == GLFW_PRESS;
+            if (f1Now && !prevF1Down) showUI = !showUI;
+            if (f11Now && !prevF11Down) {
+                borderless = !borderless;
+                if (borderless) {
+                    glfwGetWindowPos(window, &saveWinX, &saveWinY);
+                    glfwGetWindowSize(window, &saveWinW, &saveWinH);
+                    GLFWmonitor* mon = glfwGetPrimaryMonitor();
+                    const GLFWvidmode* vm = mon ? glfwGetVideoMode(mon) : nullptr;
+                    glfwSetWindowAttrib(window, GLFW_DECORATED, GLFW_FALSE);
+                    if (vm) {
+                        glfwSetWindowPos(window, 0, 0);
+                        glfwSetWindowSize(window, vm->width, vm->height);
+                    }
+                } else {
+                    glfwSetWindowAttrib(window, GLFW_DECORATED, GLFW_TRUE);
+                    glfwSetWindowPos(window, saveWinX, saveWinY);
+                    glfwSetWindowSize(window,
+                                      saveWinW > 0 ? saveWinW : 1024,
+                                      saveWinH > 0 ? saveWinH : 720);
+                }
+            }
+            prevF1Down  = f1Now;
+            prevF11Down = f11Now;
+        }
 
         // Pull any pending MIDI CC values into Twin Self params before any
         // UI / draw code reads them this frame. Manual UI edits made later
@@ -930,6 +970,7 @@ int main() {
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
 
+        if (showUI) {
         if (ImGui::Begin("Controls")) {
             ImGui::TextUnformatted("Live IPC sources (Phase B):");
             auto channelRow = [&](LiveChannel& ch, const char* label) {
@@ -1288,6 +1329,7 @@ int main() {
             }
         }
         ImGui::End();
+        }  // if (showUI)
 
         int displayW = 0;
         int displayH = 0;
