@@ -18,3 +18,10 @@ build-*/
 # Local config / personal session data
 local.cmake
 *.vjr
+
+# CMake FetchContent cache (when checked out in-tree by mistake)
+_deps/
+
+# ImGui state file (per-machine)
+imgui.ini
+
