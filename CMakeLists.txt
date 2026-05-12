@@ -73,6 +73,15 @@ add_executable(vj-mix-spike1
 target_link_libraries(vj-mix-spike1 PRIVATE vj imgui vj_ipc_ring)
 target_include_directories(vj-mix-spike1 PRIVATE src)
 
+# On MinGW, static-link the C++ / GCC runtime so the resulting exe does not
+# depend on the user's libstdc++-6.dll / libgcc_s-*.dll versions. This avoids
+# "entry point clock_gettime64 not found in libstdc++-6.dll" type failures
+# when the runtime DLL on the host predates the build's import library.
+if(MINGW)
+    target_link_options(vj-mix-spike1 PRIVATE
+        -static-libstdc++ -static-libgcc -static)
+endif()
+
 # ---------------------------------------------------------------------------
 # IPC ring (Windows shared-memory SPSC). POSIX impl deferred.
 # ---------------------------------------------------------------------------

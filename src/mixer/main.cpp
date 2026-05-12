@@ -213,8 +213,21 @@ void main() {
         if (u_clut_mode == 1) {
             discard;
         } else if (u_clut_mode == 2) {
-            vec3 col = hash3(v_hash);
-            frag_color = vec4(col, 1.0) * v_color;
+            // Noise mode: pure per-prim hash colour, ignore vertex colour
+            // (PS1 textured prims often carry v_color=0 or 0x808080 which
+            // would attenuate or kill the noise tint). Mix the per-prim
+            // hash with the screen-space pixel position so polygons that
+            // share a hostTag (common for UI text in PSX games) still
+            // get distinct, varying colours.
+            float pixHash = fract(sin(dot(gl_FragCoord.xy,
+                                          vec2(12.9898, 78.233))) * 43758.5453);
+            float h = fract(v_hash + pixHash * 0.5);
+            vec3 col = hash3(h);
+            // Force at least one channel to saturate so colours don't
+            // collapse to grey.
+            float m = max(max(col.r, col.g), col.b);
+            if (m > 0.0) col /= m;
+            frag_color = vec4(col, 1.0);
             return;
         }
         // mode == 0: fall through to direct sampling (current behaviour)
