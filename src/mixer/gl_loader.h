@@ -38,6 +38,12 @@ typedef ptrdiff_t GLsizeiptr_compat;
 #ifndef GL_LINK_STATUS
 #define GL_LINK_STATUS        0x8B82
 #endif
+#ifndef GL_TEXTURE0
+#define GL_TEXTURE0           0x84C0
+#endif
+#ifndef GL_CLAMP_TO_EDGE
+#define GL_CLAMP_TO_EDGE      0x812F
+#endif
 
 // Function-pointer typedefs.
 #ifdef _WIN32
@@ -70,6 +76,8 @@ typedef void   (VJGL_APIENTRY *PFNGLBINDBUFFERPROC_)(GLenum, GLuint);
 typedef void   (VJGL_APIENTRY *PFNGLBUFFERDATAPROC_)(GLenum, GLsizeiptr_compat, const void*, GLenum);
 typedef void   (VJGL_APIENTRY *PFNGLVERTEXATTRIBPOINTERPROC_)(GLuint, GLint, GLenum, GLboolean, GLsizei, const void*);
 typedef void   (VJGL_APIENTRY *PFNGLENABLEVERTEXATTRIBARRAYPROC_)(GLuint);
+typedef void   (VJGL_APIENTRY *PFNGLACTIVETEXTUREPROC_)(GLenum);
+typedef void   (VJGL_APIENTRY *PFNGLUNIFORM1IPROC_)(GLint, GLint);
 
 extern PFNGLCREATESHADERPROC_            vjgl_CreateShader;
 extern PFNGLSHADERSOURCEPROC_            vjgl_ShaderSource;
@@ -95,6 +103,8 @@ extern PFNGLBINDBUFFERPROC_              vjgl_BindBuffer;
 extern PFNGLBUFFERDATAPROC_              vjgl_BufferData;
 extern PFNGLVERTEXATTRIBPOINTERPROC_     vjgl_VertexAttribPointer;
 extern PFNGLENABLEVERTEXATTRIBARRAYPROC_ vjgl_EnableVertexAttribArray;
+extern PFNGLACTIVETEXTUREPROC_           vjgl_ActiveTexture;
+extern PFNGLUNIFORM1IPROC_               vjgl_Uniform1i;
 
 // Load all extern pointers via glfwGetProcAddress. Returns false if any
 // look-up fails.

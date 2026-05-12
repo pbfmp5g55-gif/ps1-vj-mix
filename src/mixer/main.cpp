@@ -26,6 +26,22 @@ void glfwErrorCallback(int code, const char* msg) {
 // PS1 native resolution we render at. The window upscales from this.
 constexpr int kPS1Width  = 320;
 constexpr int kPS1Height = 240;
+constexpr int kVRAMWidth  = 1024;
+constexpr int kVRAMHeight = 512;
+
+// Convert PS1 5/5/5/mask 16bpp to RGBA8 (we ignore the mask bit; black
+// stays black, which the textured shader maps to transparent via alpha=0).
+uint32_t convertPSX16toRGBA8(uint16_t px) {
+    const uint32_t r = (px >> 0)  & 0x1F;
+    const uint32_t g = (px >> 5)  & 0x1F;
+    const uint32_t b = (px >> 10) & 0x1F;
+    // 5->8 bit expansion: (x << 3) | (x >> 2)
+    const uint32_t R = (r << 3) | (r >> 2);
+    const uint32_t G = (g << 3) | (g >> 2);
+    const uint32_t B = (b << 3) | (b >> 2);
+    const uint32_t A = (px == 0) ? 0u : 0xFFu;
+    return R | (G << 8) | (B << 16) | (A << 24);
+}
 
 struct LoadedRecording {
     std::string                path;
@@ -91,13 +107,57 @@ out vec4 frag_color;
 void main() { frag_color = v_color; }
 )";
 
+// Textured pipeline: per-vertex packs pos / world-VRAM uv / vertex colour.
+const char* kTexVertexSrc = R"(#version 330 core
+layout(location = 0) in vec2 a_pos;
+layout(location = 1) in vec2 a_uv;     // world-VRAM coords (with TPage base added)
+layout(location = 2) in vec4 a_color;
+uniform vec2 u_psx_size;
+uniform vec2 u_vram_size;
+out vec2 v_uv;
+out vec4 v_color;
+void main() {
+    vec2 ndc = vec2(
+        (a_pos.x / u_psx_size.x) * 2.0 - 1.0,
+        1.0 - (a_pos.y / u_psx_size.y) * 2.0
+    );
+    gl_Position = vec4(ndc, 0.0, 1.0);
+    v_uv = a_uv / u_vram_size;
+    v_color = a_color;
+}
+)";
+
+const char* kTexFragmentSrc = R"(#version 330 core
+in vec2 v_uv;
+in vec4 v_color;
+uniform sampler2D u_vram;
+out vec4 frag_color;
+void main() {
+    vec4 t = texture(u_vram, v_uv);
+    if (t.a < 0.01) discard;
+    frag_color = t * v_color;
+}
+)";
+
 struct Renderer {
+    // Untextured pipeline.
     GLuint program = 0;
     GLuint vao     = 0;
     GLuint vbo     = 0;
     GLint  uPsxSize = -1;
-
     std::vector<float> verts;  // x,y,r,g,b,a per vertex
+
+    // Textured pipeline.
+    GLuint texProgram = 0;
+    GLuint texVao     = 0;
+    GLuint texVbo     = 0;
+    GLint  texUPsxSize  = -1;
+    GLint  texUVramSize = -1;
+    GLint  texUSampler  = -1;
+    GLuint vramTex      = 0;
+    std::vector<float> texVerts;  // x,y,u,v,r,g,b,a per vertex
+    // Persistent CPU-side mirror so we can re-upload after a GL reset.
+    std::vector<uint32_t> vramMirror;  // kVRAMWidth*kVRAMHeight pixels
 
     GLuint compileShader(GLenum type, const char* src) {
         GLuint sh = vjgl_CreateShader(type);
@@ -113,24 +173,30 @@ struct Renderer {
         return sh;
     }
 
-    bool init() {
-        GLuint vs = compileShader(GL_VERTEX_SHADER, kVertexSrc);
-        GLuint fs = compileShader(GL_FRAGMENT_SHADER, kFragmentSrc);
-        program = vjgl_CreateProgram();
-        vjgl_AttachShader(program, vs);
-        vjgl_AttachShader(program, fs);
-        vjgl_LinkProgram(program);
+    GLuint linkProgram(const char* vs_src, const char* fs_src) {
+        GLuint vs = compileShader(GL_VERTEX_SHADER, vs_src);
+        GLuint fs = compileShader(GL_FRAGMENT_SHADER, fs_src);
+        GLuint prog = vjgl_CreateProgram();
+        vjgl_AttachShader(prog, vs);
+        vjgl_AttachShader(prog, fs);
+        vjgl_LinkProgram(prog);
         GLint ok = 0;
-        vjgl_GetProgramiv(program, GL_LINK_STATUS, &ok);
+        vjgl_GetProgramiv(prog, GL_LINK_STATUS, &ok);
         if (!ok) {
             char log[1024];
-            vjgl_GetProgramInfoLog(program, sizeof(log), nullptr, log);
+            vjgl_GetProgramInfoLog(prog, sizeof(log), nullptr, log);
             std::fprintf(stderr, "[program] link failed: %s\n", log);
-            return false;
+            vjgl_DeleteProgram(prog);
+            prog = 0;
         }
         vjgl_DeleteShader(vs);
         vjgl_DeleteShader(fs);
+        return prog;
+    }
 
+    bool init() {
+        program = linkProgram(kVertexSrc, kFragmentSrc);
+        if (!program) return false;
         uPsxSize = vjgl_GetUniformLocation(program, "u_psx_size");
 
         vjgl_GenVertexArrays(1, &vao);
@@ -144,7 +210,66 @@ struct Renderer {
                                  reinterpret_cast<void*>(2 * sizeof(float)));
         vjgl_EnableVertexAttribArray(1);
         vjgl_BindVertexArray(0);
+
+        // Textured pipeline.
+        texProgram = linkProgram(kTexVertexSrc, kTexFragmentSrc);
+        if (!texProgram) return false;
+        texUPsxSize  = vjgl_GetUniformLocation(texProgram, "u_psx_size");
+        texUVramSize = vjgl_GetUniformLocation(texProgram, "u_vram_size");
+        texUSampler  = vjgl_GetUniformLocation(texProgram, "u_vram");
+
+        vjgl_GenVertexArrays(1, &texVao);
+        vjgl_GenBuffers(1, &texVbo);
+        vjgl_BindVertexArray(texVao);
+        vjgl_BindBuffer(GL_ARRAY_BUFFER, texVbo);
+        vjgl_VertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 8 * sizeof(float),
+                                 reinterpret_cast<void*>(0));
+        vjgl_EnableVertexAttribArray(0);
+        vjgl_VertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 8 * sizeof(float),
+                                 reinterpret_cast<void*>(2 * sizeof(float)));
+        vjgl_EnableVertexAttribArray(1);
+        vjgl_VertexAttribPointer(2, 4, GL_FLOAT, GL_FALSE, 8 * sizeof(float),
+                                 reinterpret_cast<void*>(4 * sizeof(float)));
+        vjgl_EnableVertexAttribArray(2);
+        vjgl_BindVertexArray(0);
+
+        // VRAM texture (RGBA8 mirror of PS1 VRAM). Init to all-zero.
+        vramMirror.assign(static_cast<size_t>(kVRAMWidth) * kVRAMHeight, 0);
+        glGenTextures(1, &vramTex);
+        glBindTexture(GL_TEXTURE_2D, vramTex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, kVRAMWidth, kVRAMHeight, 0,
+                     GL_RGBA, GL_UNSIGNED_BYTE, vramMirror.data());
+
         return true;
+    }
+
+    void applyUploads(const std::vector<vj::VRAMUpload>& uploads) {
+        if (uploads.empty()) return;
+        glBindTexture(GL_TEXTURE_2D, vramTex);
+        std::vector<uint32_t> patch;
+        for (const auto& u : uploads) {
+            if (u.w <= 0 || u.h <= 0) continue;
+            if (u.x < 0 || u.y < 0) continue;
+            if (u.x + u.w > kVRAMWidth || u.y + u.h > kVRAMHeight) continue;
+            const size_t n = static_cast<size_t>(u.w) * u.h;
+            patch.resize(n);
+            for (size_t i = 0; i < n && i < u.data.size(); ++i) {
+                patch[i] = convertPSX16toRGBA8(u.data[i]);
+            }
+            glTexSubImage2D(GL_TEXTURE_2D, 0, u.x, u.y, u.w, u.h,
+                            GL_RGBA, GL_UNSIGNED_BYTE, patch.data());
+            // Mirror the patch so we never lose state.
+            for (int row = 0; row < u.h; ++row) {
+                const size_t srcOff = static_cast<size_t>(row) * u.w;
+                const size_t dstOff = static_cast<size_t>(u.y + row) * kVRAMWidth + u.x;
+                std::memcpy(&vramMirror[dstOff], &patch[srcOff],
+                            static_cast<size_t>(u.w) * sizeof(uint32_t));
+            }
+        }
     }
 
     void pushTri(const vj::Vertex& a, const vj::Vertex& b, const vj::Vertex& c) {
@@ -209,12 +334,79 @@ struct Renderer {
         return drawn;
     }
 
+    int drawTextured(const std::vector<vj::Primitive>& prims,
+                     int viewportX, int viewportY,
+                     int viewportW, int viewportH,
+                     float colorMul = 1.0f) {
+        texVerts.clear();
+        int drawn = 0;
+        for (const auto& p : prims) {
+            if (!p.textured) continue;
+            // hostTag layout (from upstream HOOKS.md):
+            //   tpage.raw[bits 24..39] | twindow[20..23] | clut[16..23 etc] | shape_tag[0..2]
+            // PS1 TPage encoding (within tpage.raw bits 0..15):
+            //   TX (4)  = base X / 64  (so TPageBaseX = TX * 64)
+            //   TY (1)  = base Y / 256 (so TPageBaseY = TY * 256)
+            //   TP (2)  = bpp mode (0=4bpp, 1=8bpp, 2=15bpp)
+            const uint64_t tpageRaw = (p.hostTag >> 24) & 0xFFFF;
+            const float TPageBaseX = static_cast<float>((tpageRaw & 0xF) * 64);
+            const float TPageBaseY = static_cast<float>(((tpageRaw >> 4) & 0x1) * 256);
+            auto pushVtx = [&](const vj::Vertex& v) {
+                texVerts.push_back(v.x);
+                texVerts.push_back(v.y);
+                texVerts.push_back(TPageBaseX + v.u);
+                texVerts.push_back(TPageBaseY + v.v);
+                texVerts.push_back((v.r / 255.0f) * colorMul);
+                texVerts.push_back((v.g / 255.0f) * colorMul);
+                texVerts.push_back((v.b / 255.0f) * colorMul);
+                texVerts.push_back(v.a / 255.0f);
+            };
+            auto pushTriV = [&](const vj::Vertex& a, const vj::Vertex& b,
+                                const vj::Vertex& c) {
+                pushVtx(a); pushVtx(b); pushVtx(c);
+            };
+            if (p.kind == vj::PrimitiveKind::Triangle && p.vertices.size() >= 3) {
+                pushTriV(p.vertices[0], p.vertices[1], p.vertices[2]);
+                ++drawn;
+            } else if (p.kind == vj::PrimitiveKind::Quad && p.vertices.size() >= 4) {
+                pushTriV(p.vertices[0], p.vertices[1], p.vertices[2]);
+                pushTriV(p.vertices[1], p.vertices[3], p.vertices[2]);
+                ++drawn;
+            }
+        }
+        if (texVerts.empty()) return drawn;
+
+        glViewport(viewportX, viewportY, viewportW, viewportH);
+        vjgl_UseProgram(texProgram);
+        vjgl_Uniform2f(texUPsxSize, static_cast<float>(kPS1Width),
+                       static_cast<float>(kPS1Height));
+        vjgl_Uniform2f(texUVramSize, static_cast<float>(kVRAMWidth),
+                       static_cast<float>(kVRAMHeight));
+        vjgl_ActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, vramTex);
+        vjgl_Uniform1i(texUSampler, 0);
+        vjgl_BindVertexArray(texVao);
+        vjgl_BindBuffer(GL_ARRAY_BUFFER, texVbo);
+        vjgl_BufferData(GL_ARRAY_BUFFER,
+                        static_cast<GLsizeiptr_compat>(texVerts.size() * sizeof(float)),
+                        texVerts.data(), GL_DYNAMIC_DRAW);
+        glDrawArrays(GL_TRIANGLES, 0,
+                     static_cast<GLsizei>(texVerts.size() / 8));
+        vjgl_BindVertexArray(0);
+        return drawn;
+    }
+
     void shutdown() {
         if (vbo) vjgl_DeleteBuffers(1, &vbo);
         if (vao) vjgl_DeleteVertexArrays(1, &vao);
         if (program) vjgl_DeleteProgram(program);
-        vbo = vao = 0;
-        program = 0;
+        if (texVbo) vjgl_DeleteBuffers(1, &texVbo);
+        if (texVao) vjgl_DeleteVertexArrays(1, &texVao);
+        if (texProgram) vjgl_DeleteProgram(texProgram);
+        if (vramTex) glDeleteTextures(1, &vramTex);
+        vbo = vao = texVbo = texVao = 0;
+        program = texProgram = 0;
+        vramTex = 0;
     }
 };
 
@@ -343,7 +535,8 @@ int main() {
                 ImGui::Separator();
                 ImGui::Text("Source frameIndex: %d", fr.frameIndex);
                 ImGui::Text("Primitives:        %zu", fr.primitives.size());
-                ImGui::Text("Drawn (untextured): %d", lastDrawn);
+                ImGui::Text("VRAM uploads:      %zu", fr.uploads.size());
+                ImGui::Text("Drawn (total):     %d", lastDrawn);
 
                 ImGui::Separator();
                 ImGui::Checkbox("Twin Self (overlay past frame)", &twinEnabled);
@@ -377,6 +570,11 @@ int main() {
             const int vpX = (displayW - vpW) / 2;
             const int vpY = (displayH - vpH) / 2;
 
+            // Apply VRAM uploads from the current frame BEFORE any draws.
+            const auto& fr =
+                recording.frames[static_cast<size_t>(currentFrame)];
+            renderer.applyUploads(fr.uploads);
+
             // Draw the ghost (past frame) first so the live frame overdraws
             // it. Wraps around for files shorter than the requested delay.
             if (twinEnabled) {
@@ -386,10 +584,10 @@ int main() {
                 ghostFrame %= n;
                 const auto& gh = recording.frames[static_cast<size_t>(ghostFrame)];
                 renderer.drawUntextured(gh.primitives, vpX, vpY, vpW, vpH, twinAlpha);
+                renderer.drawTextured  (gh.primitives, vpX, vpY, vpW, vpH, twinAlpha);
             }
-            const auto& fr =
-                recording.frames[static_cast<size_t>(currentFrame)];
-            lastDrawn = renderer.drawUntextured(fr.primitives, vpX, vpY, vpW, vpH);
+            lastDrawn  = renderer.drawUntextured(fr.primitives, vpX, vpY, vpW, vpH);
+            lastDrawn += renderer.drawTextured  (fr.primitives, vpX, vpY, vpW, vpH);
         } else {
             lastDrawn = 0;
         }
