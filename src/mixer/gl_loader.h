@@ -44,6 +44,12 @@ typedef ptrdiff_t GLsizeiptr_compat;
 #ifndef GL_CLAMP_TO_EDGE
 #define GL_CLAMP_TO_EDGE      0x812F
 #endif
+#ifndef GL_R16UI
+#define GL_R16UI              0x8234
+#endif
+#ifndef GL_RED_INTEGER
+#define GL_RED_INTEGER        0x8D94
+#endif
 
 // Function-pointer typedefs.
 #ifdef _WIN32

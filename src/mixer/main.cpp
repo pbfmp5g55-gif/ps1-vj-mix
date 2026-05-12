@@ -78,7 +78,7 @@ bool unpackLiveUpload(const uint8_t* buf, size_t len, vj::VRAMUpload& u) {
 
 // Convert PS1 5/5/5/mask 16bpp to RGBA8 (we ignore the mask bit; black
 // stays black, which the textured shader maps to transparent via alpha=0).
-uint32_t convertPSX16toRGBA8(uint16_t px) {
+[[maybe_unused]] uint32_t convertPSX16toRGBA8(uint16_t px) {
     const uint32_t r = (px >> 0)  & 0x1F;
     const uint32_t g = (px >> 5)  & 0x1F;
     const uint32_t b = (px >> 10) & 0x1F;
@@ -154,49 +154,60 @@ out vec4 frag_color;
 void main() { frag_color = v_color; }
 )";
 
-// Textured pipeline: per-vertex packs pos / world-VRAM uv / vertex colour
-// + a CLUT-kind tag and a per-primitive hash (both derived on the CPU side
-// from hostTag's TPage bits and forwarded down the pipeline).
+// Textured pipeline: per-vertex packs pos / raw PS1 texel u,v / vertex colour
+// + a CLUT-kind tag, per-primitive hash, TPage base (VRAM pixel coords) and
+// CLUT base (VRAM pixel coords). The fragment shader does its own bpp-aware
+// indexing into VRAM (which is now an unsigned 16-bit texture so we can pull
+// raw bytes for palette lookup).
 const char* kTexVertexSrc = R"(#version 330 core
-layout(location = 0) in vec2 a_pos;
-layout(location = 1) in vec2 a_uv;
-layout(location = 2) in vec4 a_color;
+layout(location = 0) in vec2  a_pos;
+layout(location = 1) in vec2  a_uv_raw;     // raw PS1 texel coords (0..255)
+layout(location = 2) in vec4  a_color;
 layout(location = 3) in float a_clut_kind;
 layout(location = 4) in float a_hash;
+layout(location = 5) in vec2  a_tpage_base; // VRAM pixel coords
+layout(location = 6) in vec2  a_clut_base;  // VRAM pixel coords
 uniform vec2 u_psx_size;
-uniform vec2 u_vram_size;
-out vec2 v_uv;
+out vec2 v_uv_raw;
 out vec4 v_color;
-flat out int v_clut_kind;
+flat out int   v_clut_kind;
 flat out float v_hash;
+flat out vec2  v_tpage_base;
+flat out vec2  v_clut_base;
 void main() {
     vec2 ndc = vec2(
         (a_pos.x / u_psx_size.x) * 2.0 - 1.0,
         1.0 - (a_pos.y / u_psx_size.y) * 2.0
     );
     gl_Position = vec4(ndc, 0.0, 1.0);
-    v_uv = a_uv / u_vram_size;
-    v_color = a_color;
-    v_clut_kind = int(a_clut_kind);
-    v_hash = a_hash;
+    v_uv_raw     = a_uv_raw;
+    v_color      = a_color;
+    v_clut_kind  = int(a_clut_kind);
+    v_hash       = a_hash;
+    v_tpage_base = a_tpage_base;
+    v_clut_base  = a_clut_base;
 }
 )";
 
 // CLUT VJ modes:
-//   0 = Direct sample (current behaviour; CLUT prims show VRAM bytes as RGB,
-//                      which often looks black/garbage but is "correct" for
-//                      15bpp direct-colour textures)
+//   0 = Direct sample (legacy "VJ" mode; CLUT prims read raw VRAM bytes as if
+//                      15bpp colour. Looks broken on purpose for 4/8bpp CLUT
+//                      sprites; matches the older renderer's behaviour.)
 //   1 = Discard CLUT  (CLUT prims drawn fully transparent; silhouette feel)
 //   2 = Noise CLUT    (CLUT prims tinted from a per-prim hash; chaos feel)
-// A 'clean' palette-aware mode is future work (M5+); the renderer would need
-// indirect texture lookup against the CLUT region of VRAM.
+//   3 = Clean CLUT    (proper PS1 palette indirect lookup: read the nibble/
+//                      byte index from the texture page, then read the actual
+//                      RGB from the CLUT region of VRAM. This is the only
+//                      mode that reproduces the original game graphics.)
 const char* kTexFragmentSrc = R"(#version 330 core
-in vec2 v_uv;
+in vec2 v_uv_raw;
 in vec4 v_color;
-flat in int v_clut_kind;     // 0=direct/15bpp, 1=4bpp CLUT, 2=8bpp CLUT
+flat in int   v_clut_kind;     // 0=direct/15bpp, 1=4bpp CLUT, 2=8bpp CLUT
 flat in float v_hash;
-uniform sampler2D u_vram;
-uniform int u_clut_mode;     // 0=direct sample, 1=discard CLUT, 2=noise CLUT
+flat in vec2  v_tpage_base;
+flat in vec2  v_clut_base;
+uniform usampler2D u_vram;     // raw 16-bit PS1 VRAM
+uniform int u_clut_mode;       // 0=direct, 1=discard, 2=noise, 3=clean
 out vec4 frag_color;
 
 vec3 hash3(float h) {
@@ -207,33 +218,76 @@ vec3 hash3(float h) {
     ));
 }
 
+vec4 decodePSX(uint p) {
+    float r = float((p >>  0u) & 0x1Fu) / 31.0;
+    float g = float((p >>  5u) & 0x1Fu) / 31.0;
+    float b = float((p >> 10u) & 0x1Fu) / 31.0;
+    // PS1 convention: a palette / texture word of exactly 0x0000 means
+    // fully transparent. Anything else is opaque (the stp / mask bit
+    // governs semi-transparency, which we ignore for now).
+    float a = (p == 0u) ? 0.0 : 1.0;
+    return vec4(r, g, b, a);
+}
+
 void main() {
-    vec4 t = texture(u_vram, v_uv);
-    if (v_clut_kind != 0) {
-        if (u_clut_mode == 1) {
-            discard;
-        } else if (u_clut_mode == 2) {
-            // Noise mode: pure per-prim hash colour, ignore vertex colour
-            // (PS1 textured prims often carry v_color=0 or 0x808080 which
-            // would attenuate or kill the noise tint). Mix the per-prim
-            // hash with the screen-space pixel position so polygons that
-            // share a hostTag (common for UI text in PSX games) still
-            // get distinct, varying colours.
-            float pixHash = fract(sin(dot(gl_FragCoord.xy,
-                                          vec2(12.9898, 78.233))) * 43758.5453);
-            float h = fract(v_hash + pixHash * 0.5);
-            vec3 col = hash3(h);
-            // Force at least one channel to saturate so colours don't
-            // collapse to grey.
-            float m = max(max(col.r, col.g), col.b);
-            if (m > 0.0) col /= m;
-            frag_color = vec4(col, 1.0);
-            return;
-        }
-        // mode == 0: fall through to direct sampling (current behaviour)
+    int psxU = int(v_uv_raw.x);
+    int psxV = int(v_uv_raw.y);
+    int tpx  = int(v_tpage_base.x);
+    int tpy  = int(v_tpage_base.y);
+
+    // 15bpp direct-colour: no CLUT, sample VRAM at TPage + raw u,v.
+    if (v_clut_kind == 0) {
+        uint raw = texelFetch(u_vram, ivec2(tpx + psxU, tpy + psxV), 0).r;
+        vec4 c = decodePSX(raw);
+        if (c.a < 0.5) discard;
+        frag_color = c * v_color;
+        return;
     }
-    if (t.a < 0.01) discard;
-    frag_color = t * v_color;
+
+    // CLUT-indexed (4bpp or 8bpp). Mode dictates how we colour.
+    if (u_clut_mode == 1) discard;
+    if (u_clut_mode == 2) {
+        // Noise: per-prim hash mixed with screen-space hash, saturated.
+        float pixHash = fract(sin(dot(gl_FragCoord.xy,
+                                      vec2(12.9898, 78.233))) * 43758.5453);
+        float h = fract(v_hash + pixHash * 0.5);
+        vec3 col = hash3(h);
+        float m = max(max(col.r, col.g), col.b);
+        if (m > 0.0) col /= m;
+        frag_color = vec4(col, 1.0);
+        return;
+    }
+    if (u_clut_mode == 0) {
+        // Legacy Direct: read VRAM at PSX-texel offset (which is wrong for
+        // 4/8bpp — that's the point: it produces the "garbage" look).
+        uint raw = texelFetch(u_vram, ivec2(tpx + psxU, tpy + psxV), 0).r;
+        vec4 c = decodePSX(raw);
+        if (c.a < 0.5) discard;
+        frag_color = c * v_color;
+        return;
+    }
+
+    // u_clut_mode == 3: Clean palette lookup.
+    uint idx;
+    if (v_clut_kind == 1) {
+        // 4bpp: 4 nibbles per 16-bit VRAM pixel.
+        int vramX = tpx + (psxU >> 2);
+        int shift = (psxU & 3) * 4;
+        uint raw = texelFetch(u_vram, ivec2(vramX, tpy + psxV), 0).r;
+        idx = (raw >> uint(shift)) & 0xFu;
+    } else {
+        // 8bpp: 2 bytes per 16-bit VRAM pixel.
+        int vramX = tpx + (psxU >> 1);
+        int shift = (psxU & 1) * 8;
+        uint raw = texelFetch(u_vram, ivec2(vramX, tpy + psxV), 0).r;
+        idx = (raw >> uint(shift)) & 0xFFu;
+    }
+    int cx = int(v_clut_base.x);
+    int cy = int(v_clut_base.y);
+    uint pal = texelFetch(u_vram, ivec2(cx + int(idx), cy), 0).r;
+    vec4 c = decodePSX(pal);
+    if (c.a < 0.5) discard;
+    frag_color = c * v_color;
 }
 )";
 
@@ -255,7 +309,7 @@ struct Renderer {
     GLuint vramTex      = 0;
     std::vector<float> texVerts;  // x,y,u,v,r,g,b,a per vertex
     // Persistent CPU-side mirror so we can re-upload after a GL reset.
-    std::vector<uint32_t> vramMirror;  // kVRAMWidth*kVRAMHeight pixels
+    std::vector<uint16_t> vramMirror;  // kVRAMWidth*kVRAMHeight raw 16-bit pixels
 
     GLuint compileShader(GLenum type, const char* src) {
         GLuint sh = vjgl_CreateShader(type);
@@ -321,7 +375,7 @@ struct Renderer {
         vjgl_BindVertexArray(texVao);
         vjgl_BindBuffer(GL_ARRAY_BUFFER, texVbo);
         // Vertex layout: x,y, u,v, r,g,b,a, clut_kind, hash  = 10 floats
-        constexpr GLsizei kTexStride = 10 * sizeof(float);
+        constexpr GLsizei kTexStride = 14 * sizeof(float);
         vjgl_VertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, kTexStride,
                                  reinterpret_cast<void*>(0));
         vjgl_EnableVertexAttribArray(0);
@@ -337,9 +391,16 @@ struct Renderer {
         vjgl_VertexAttribPointer(4, 1, GL_FLOAT, GL_FALSE, kTexStride,
                                  reinterpret_cast<void*>(9 * sizeof(float)));
         vjgl_EnableVertexAttribArray(4);
+        vjgl_VertexAttribPointer(5, 2, GL_FLOAT, GL_FALSE, kTexStride,
+                                 reinterpret_cast<void*>(10 * sizeof(float)));
+        vjgl_EnableVertexAttribArray(5);
+        vjgl_VertexAttribPointer(6, 2, GL_FLOAT, GL_FALSE, kTexStride,
+                                 reinterpret_cast<void*>(12 * sizeof(float)));
+        vjgl_EnableVertexAttribArray(6);
         vjgl_BindVertexArray(0);
 
-        // VRAM texture (RGBA8 mirror of PS1 VRAM). Init to all-zero.
+        // VRAM texture: raw 16-bit PS1 VRAM as R16UI so the shader can pull
+        // bytes / nibbles for 8bpp / 4bpp CLUT palette indexing.
         vramMirror.assign(static_cast<size_t>(kVRAMWidth) * kVRAMHeight, 0);
         glGenTextures(1, &vramTex);
         glBindTexture(GL_TEXTURE_2D, vramTex);
@@ -347,8 +408,8 @@ struct Renderer {
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, kVRAMWidth, kVRAMHeight, 0,
-                     GL_RGBA, GL_UNSIGNED_BYTE, vramMirror.data());
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_R16UI, kVRAMWidth, kVRAMHeight, 0,
+                     GL_RED_INTEGER, GL_UNSIGNED_SHORT, vramMirror.data());
 
         return true;
     }
@@ -357,24 +418,20 @@ struct Renderer {
                       int xRelocate = 0) {
         if (uploads.empty()) return;
         glBindTexture(GL_TEXTURE_2D, vramTex);
-        std::vector<uint32_t> patch;
         for (const auto& u : uploads) {
             const int ux = u.x + xRelocate;
             if (u.w <= 0 || u.h <= 0) continue;
             if (ux < 0 || u.y < 0) continue;
             if (ux + u.w > kVRAMWidth || u.y + u.h > kVRAMHeight) continue;
             const size_t n = static_cast<size_t>(u.w) * u.h;
-            patch.resize(n);
-            for (size_t i = 0; i < n && i < u.data.size(); ++i) {
-                patch[i] = convertPSX16toRGBA8(u.data[i]);
-            }
+            if (u.data.size() < n) continue;
             glTexSubImage2D(GL_TEXTURE_2D, 0, ux, u.y, u.w, u.h,
-                            GL_RGBA, GL_UNSIGNED_BYTE, patch.data());
+                            GL_RED_INTEGER, GL_UNSIGNED_SHORT, u.data.data());
             for (int row = 0; row < u.h; ++row) {
                 const size_t srcOff = static_cast<size_t>(row) * u.w;
                 const size_t dstOff = static_cast<size_t>(u.y + row) * kVRAMWidth + ux;
-                std::memcpy(&vramMirror[dstOff], &patch[srcOff],
-                            static_cast<size_t>(u.w) * sizeof(uint32_t));
+                std::memcpy(&vramMirror[dstOff], &u.data[srcOff],
+                            static_cast<size_t>(u.w) * sizeof(uint16_t));
             }
         }
     }
@@ -479,19 +536,26 @@ struct Renderer {
                            const vj::Vertex& a, const vj::Vertex& b,
                            const vj::Vertex& c,
                            float TPageBaseX, float TPageBaseY,
+                           float clutBaseX, float clutBaseY,
                            float colorMul,
                            float clutKind, float primHash) {
         auto push = [&](const vj::Vertex& v) {
             out.push_back(v.x);
             out.push_back(v.y);
-            out.push_back(TPageBaseX + v.u);
-            out.push_back(TPageBaseY + v.v);
+            // RAW PS1 texel coords; fragment shader applies TPage offset
+            // and the appropriate bpp-aware stride itself.
+            out.push_back(v.u);
+            out.push_back(v.v);
             out.push_back((v.r / 255.0f) * colorMul);
             out.push_back((v.g / 255.0f) * colorMul);
             out.push_back((v.b / 255.0f) * colorMul);
             out.push_back(v.a / 255.0f);
             out.push_back(clutKind);
             out.push_back(primHash);
+            out.push_back(TPageBaseX);
+            out.push_back(TPageBaseY);
+            out.push_back(clutBaseX);
+            out.push_back(clutBaseY);
         };
         push(a); push(b); push(c);
     }
@@ -520,7 +584,7 @@ struct Renderer {
         vjgl_BufferData(GL_ARRAY_BUFFER,
                         static_cast<GLsizeiptr_compat>(buf.size() * sizeof(float)),
                         buf.data(), GL_DYNAMIC_DRAW);
-        glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(buf.size() / 10));
+        glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(buf.size() / 14));
         vjgl_BindVertexArray(0);
     }
 
@@ -552,6 +616,12 @@ struct Renderer {
             if (tpField == 0)      { clutKind = 1.0f; ++stat4bppPrims; }
             else if (tpField == 1) { clutKind = 2.0f; ++stat8bppPrims; }
             else                   { clutKind = 0.0f; ++statDirectPrims; }
+            // CLUT base lives in hostTag bits 0..15 (the PS1 'clutraw' field).
+            //   bits 0..5  = clutX / 16    (X is a multiple of 16, 0..1008)
+            //   bits 6..14 = clutY         (0..511)
+            const uint32_t clutRaw = static_cast<uint32_t>(p.hostTag & 0xFFFF);
+            const float clutBaseX = static_cast<float>((clutRaw & 0x3F) * 16);
+            const float clutBaseY = static_cast<float>((clutRaw >> 6) & 0x1FF);
             const float primHash =
                 static_cast<float>(static_cast<uint32_t>(p.hostTag * 2654435761u) & 0xFFFF) /
                 65535.0f;
@@ -559,13 +629,16 @@ struct Renderer {
                 (p.blendMode == vj::BlendMode::Opaque) ? texVerts : texVertsSemi;
             if (p.kind == vj::PrimitiveKind::Triangle && p.vertices.size() >= 3) {
                 pushTriTex(bucket, p.vertices[0], p.vertices[1], p.vertices[2],
-                           TPageBaseX, TPageBaseY, colorMul, clutKind, primHash);
+                           TPageBaseX, TPageBaseY, clutBaseX, clutBaseY,
+                           colorMul, clutKind, primHash);
                 ++drawn;
             } else if (p.kind == vj::PrimitiveKind::Quad && p.vertices.size() >= 4) {
                 pushTriTex(bucket, p.vertices[0], p.vertices[1], p.vertices[2],
-                           TPageBaseX, TPageBaseY, colorMul, clutKind, primHash);
+                           TPageBaseX, TPageBaseY, clutBaseX, clutBaseY,
+                           colorMul, clutKind, primHash);
                 pushTriTex(bucket, p.vertices[1], p.vertices[3], p.vertices[2],
-                           TPageBaseX, TPageBaseY, colorMul, clutKind, primHash);
+                           TPageBaseX, TPageBaseY, clutBaseX, clutBaseY,
+                           colorMul, clutKind, primHash);
                 ++drawn;
             }
         }
@@ -573,8 +646,8 @@ struct Renderer {
         submitTex(texVerts, viewportX, viewportY, viewportW, viewportH);
         if (!texVertsSemi.empty()) {
             // Force alpha 0.5 on the semi-transparent bucket (PS1 Average).
-            // Stride = 10 floats; alpha index within each vertex is 7.
-            for (size_t i = 7; i < texVertsSemi.size(); i += 10) {
+            // Stride = 14 floats; alpha index within each vertex is 7.
+            for (size_t i = 7; i < texVertsSemi.size(); i += 14) {
                 texVertsSemi[i] = 0.5f;
             }
             glEnable(GL_BLEND);
@@ -806,9 +879,10 @@ int main() {
             const char* clutModes[] = {
                 "Direct sample (CLUT looks black)",
                 "Discard CLUT (silhouette)",
-                "Noise CLUT (per-prim hash color)"
+                "Noise CLUT (per-prim hash color)",
+                "Clean CLUT (proper palette lookup)"
             };
-            ImGui::Combo("CLUT mode", &renderer.clutMode, clutModes, 3);
+            ImGui::Combo("CLUT mode", &renderer.clutMode, clutModes, 4);
             ImGui::Text("Last frame: direct=%d  4bpp=%d  8bpp=%d",
                         renderer.statDirectPrims,
                         renderer.stat4bppPrims,
