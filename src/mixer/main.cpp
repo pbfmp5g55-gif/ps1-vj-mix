@@ -18,6 +18,7 @@
 #include "vj/Params.h"
 #include "vj/PrimitiveInterceptor.h"
 #include "vj/PrimitiveStream.h"
+#include "vj/RtMidiController.h"
 
 #include <GLFW/glfw3.h>
 
@@ -736,6 +737,35 @@ int main() {
     int    twinDelayFrames = 60;  // ~1 second at 60 fps
     float  twinAlpha = 0.5f;      // colour-mul factor for the ghost
 
+    // MIDI controller (libvj's RtMidi-backed). When a port is open and
+    // m_midiOverride is on, every frame we poll CC values and overwrite the
+    // Twin Self params (and any future MIDI-bound mixer params) from MIDI.
+    std::unique_ptr<vj::RtMidiController> midi;
+    int  midiPortIndex = -1;          // currently-open port, -1 = none
+    bool midiOverrideEnabled = true;  // master switch
+    std::vector<std::string> midiPortListCache;
+    bool midiPortListCached = false;
+    auto refreshMidiPorts = [&]() {
+        midiPortListCache = vj::RtMidiController::listPorts();
+        midiPortListCached = true;
+    };
+    // CC assignments. Defaults picked so they don't collide with the 8-axis
+    // glitch CCs (20..27) that pcsx-redux uses.
+    int twinEnableCC = 13;
+    int twinDelayCC  = 14;
+    int twinAlphaCC  = 15;
+    int midiLearnTarget = -1;  // 0=twinEnable, 1=twinDelay, 2=twinAlpha
+    int midiLearnSeenCC = -1;
+    auto applyMidiOverrides = [&]() {
+        if (!midi || !midiOverrideEnabled) return;
+        const int e = midi->getCC(twinEnableCC);
+        if (e >= 0) twinEnabled = (e >= 64);
+        const int d = midi->getCC(twinDelayCC);
+        if (d >= 0) twinDelayFrames = 1 + (d * 299) / 127;  // 1..300
+        const int a = midi->getCC(twinAlphaCC);
+        if (a >= 0) twinAlpha = static_cast<float>(a) / 127.0f;
+    };
+
     // Live IPC mode: two channels A and B for Phase B mixing. history holds
     // the last few hundred frames so Twin Self / echo effects can overlay a
     // delayed copy of the live stream.
@@ -784,6 +814,11 @@ int main() {
 
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
+
+        // Pull any pending MIDI CC values into Twin Self params before any
+        // UI / draw code reads them this frame. Manual UI edits made later
+        // in the same frame override these.
+        applyMidiOverrides();
 
         const double now = glfwGetTime();
         const double dt  = now - lastTickTime;
@@ -980,6 +1015,90 @@ int main() {
                                         chA.history.sizeFrames(),
                                         chB.history.sizeFrames());
                 }
+            }
+
+            // ---------------------------------------------------------------
+            // MIDI section — port selection + Twin Self CC bindings.
+            // ---------------------------------------------------------------
+            ImGui::Separator();
+            ImGui::TextUnformatted("MIDI input:");
+            if (!midiPortListCached) refreshMidiPorts();
+            const char* portLabel = midi ? midi->portName().c_str()
+                                          : "(not open)";
+            ImGui::Text("Open: %s", portLabel);
+            if (midiPortListCache.empty()) {
+                ImGui::TextDisabled("  (no MIDI input ports detected)");
+            } else {
+                for (size_t i = 0; i < midiPortListCache.size(); ++i) {
+                    const int idx = static_cast<int>(i);
+                    const bool isOpen = midi && idx == midiPortIndex;
+                    char label[256];
+                    std::snprintf(label, sizeof(label), "%s [%d] %s",
+                                  isOpen ? "[OPEN]" : "      ", idx,
+                                  midiPortListCache[i].c_str());
+                    if (ImGui::Selectable(label, isOpen)) {
+                        if (isOpen) { midi.reset(); midiPortIndex = -1; }
+                        else {
+                            midi = std::make_unique<vj::RtMidiController>(
+                                static_cast<unsigned>(idx), "ps1-vj-mix");
+                            midiPortIndex = idx;
+                        }
+                    }
+                }
+            }
+            if (ImGui::Button("Refresh MIDI")) refreshMidiPorts();
+            ImGui::SameLine();
+            ImGui::Checkbox("MIDI overrides Twin Self", &midiOverrideEnabled);
+
+            // CC mapping + learn for the three Twin Self params.
+            ImGui::TextUnformatted("Twin Self CC bindings:");
+            auto bindingRow = [&](const char* label, int* cc, int learnIdx,
+                                  const char* hint) {
+                ImGui::PushID(label);
+                ImGui::Text("%-22s", label);
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(90);
+                if (ImGui::InputInt("CC", cc, 1, 8)) {
+                    if (*cc < 0) *cc = 0;
+                    if (*cc > 127) *cc = 127;
+                }
+                ImGui::SameLine();
+                const bool armed = midiLearnTarget == learnIdx;
+                if (armed) {
+                    if (ImGui::Button("Cancel")) midiLearnTarget = -1;
+                } else {
+                    if (ImGui::Button("Learn")) {
+                        midiLearnTarget = learnIdx;
+                        midiLearnSeenCC = midi ? midi->lastReceivedCC() : -1;
+                    }
+                }
+                ImGui::SameLine();
+                const int v = midi ? midi->getCC(*cc) : -1;
+                char vbuf[16];
+                if (v < 0) std::snprintf(vbuf, sizeof(vbuf), "--");
+                else       std::snprintf(vbuf, sizeof(vbuf), "%d", v);
+                ImGui::ProgressBar(v < 0 ? 0.0f : static_cast<float>(v) / 127.0f,
+                                   ImVec2(110, 0), vbuf);
+                ImGui::SameLine();
+                ImGui::TextDisabled("%s", hint);
+                ImGui::PopID();
+            };
+            bindingRow("Twin Self enable",   &twinEnableCC, 0, "(>=64 = on)");
+            bindingRow("Twin delay frames",  &twinDelayCC,  1, "(maps 0..127 -> 1..300)");
+            bindingRow("Twin ghost bright",  &twinAlphaCC,  2, "(maps 0..127 -> 0..1)");
+
+            // Process learn: poll lastReceivedCC; when it changes commit it.
+            if (midi && midiLearnTarget >= 0) {
+                const int latest = midi->lastReceivedCC();
+                if (latest >= 0 && latest != midiLearnSeenCC) {
+                    switch (midiLearnTarget) {
+                        case 0: twinEnableCC = latest; break;
+                        case 1: twinDelayCC  = latest; break;
+                        case 2: twinAlphaCC  = latest; break;
+                    }
+                    midiLearnTarget = -1;
+                }
+                ImGui::TextDisabled("Move a MIDI control to assign...");
             }
         }
         ImGui::End();

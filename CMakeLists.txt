@@ -16,6 +16,9 @@ endif()
 # ---------------------------------------------------------------------------
 set(VJ_BUILD_DEMO  OFF CACHE BOOL "" FORCE)
 set(VJ_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+# Pull in RtMidi via libvj so the mixer can read MIDI CC values directly
+# (port listing, learn, axis-CC mapping for Twin Self / glitch / crossfade).
+set(VJ_ENABLE_RTMIDI ON CACHE BOOL "" FORCE)
 add_subdirectory(third_party/libvj)
 
 # ---------------------------------------------------------------------------
