@@ -11,6 +11,14 @@ else()
     add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
 
+# Force static linkage for all FetchContent dependencies (GLFW in
+# particular). Without this, GLFW under MSVC defaults to building
+# glfw3.dll and the release ZIP ships a vj-mix-spike1.exe that fails
+# to launch with "glfw3.dll not found". Setting BUILD_SHARED_LIBS=OFF
+# before any add_subdirectory / FetchContent_MakeAvailable picks it
+# up via CMP0077 and bakes GLFW into the exe.
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+
 # ---------------------------------------------------------------------------
 # libvj (in-tree submodule, MIT)
 # ---------------------------------------------------------------------------
