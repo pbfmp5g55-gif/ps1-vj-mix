@@ -611,20 +611,84 @@ struct Renderer {
         vjgl_BindVertexArray(0);
     }
 
-    // Scratch buffers per blend bucket (Opaque + SemiTransparent).
-    std::vector<float> vertsSemi;
+    // Scratch buffers per PS1 ABR sub-mode. Opaque + 4 semi-transparency
+    // modes (Average, Additive, Subtractive, AdditiveQuarter). Each bucket
+    // is drawn with a distinct glBlendEquation/glBlendFunc pair so the
+    // mixer reproduces the four PS1 semi-transparency modes that
+    // pcsx-redux v0.7.9 now distinguishes.
+    std::vector<float> vertsAverage;
+    std::vector<float> vertsAdditive;
+    std::vector<float> vertsSubtractive;
+    std::vector<float> vertsAddQuarter;
+
+    // Configure the GL blend pipeline for the given PS1 ABR sub-mode.
+    // Returns the vertex alpha value the bucket should be force-set to
+    // so the blend math matches PS1's mix factors.
+    //   Opaque        : alpha=1.0, blend disabled
+    //   Average       : alpha=0.5, src*alpha + dst*(1-alpha)  -> (B+F)/2
+    //   Additive      : alpha=1.0, src*1 + dst*1               -> B+F
+    //   Subtractive   : alpha=1.0, dst*1 - src*1               -> B-F
+    //   AddQuarter    : alpha=0.25, src*alpha + dst*1          -> B+F/4
+    static float configureBlendForMode(vj::BlendMode mode) {
+        switch (mode) {
+            case vj::BlendMode::Opaque:
+                glDisable(GL_BLEND);
+                return 1.0f;
+            case vj::BlendMode::Average:
+                glEnable(GL_BLEND);
+                vjgl_BlendEquation(GL_FUNC_ADD);
+                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                return 0.5f;
+            case vj::BlendMode::Additive:
+                glEnable(GL_BLEND);
+                vjgl_BlendEquation(GL_FUNC_ADD);
+                glBlendFunc(GL_ONE, GL_ONE);
+                return 1.0f;
+            case vj::BlendMode::Subtractive:
+                glEnable(GL_BLEND);
+                vjgl_BlendEquation(GL_FUNC_REVERSE_SUBTRACT);
+                glBlendFunc(GL_ONE, GL_ONE);
+                return 1.0f;
+            case vj::BlendMode::AdditiveQuarter:
+                glEnable(GL_BLEND);
+                vjgl_BlendEquation(GL_FUNC_ADD);
+                glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+                return 0.25f;
+        }
+        glDisable(GL_BLEND);
+        return 1.0f;
+    }
+
+    // Pick the right bucket for a given blend mode. Returns nullptr if the
+    // caller should send the prim to `opaque` (verts / texVerts).
+    template <typename Bucket>
+    Bucket* semiBucketFor(vj::BlendMode mode,
+                          Bucket& avg, Bucket& add, Bucket& sub, Bucket& addQ) {
+        switch (mode) {
+            case vj::BlendMode::Average:        return &avg;
+            case vj::BlendMode::Additive:       return &add;
+            case vj::BlendMode::Subtractive:    return &sub;
+            case vj::BlendMode::AdditiveQuarter: return &addQ;
+            default:                            return nullptr;  // Opaque
+        }
+    }
 
     int drawUntextured(const std::vector<vj::Primitive>& prims,
                        int viewportX, int viewportY,
                        int viewportW, int viewportH,
                        float colorMul = 1.0f) {
         verts.clear();
-        vertsSemi.clear();
+        vertsAverage.clear();
+        vertsAdditive.clear();
+        vertsSubtractive.clear();
+        vertsAddQuarter.clear();
         int drawn = 0;
         for (const auto& p : prims) {
             if (p.textured) continue;
-            std::vector<float>& bucket =
-                (p.blendMode == vj::BlendMode::Opaque) ? verts : vertsSemi;
+            std::vector<float>* semi =
+                semiBucketFor(p.blendMode, vertsAverage, vertsAdditive,
+                              vertsSubtractive, vertsAddQuarter);
+            std::vector<float>& bucket = semi ? *semi : verts;
             if (p.kind == vj::PrimitiveKind::Triangle &&
                 p.vertices.size() >= 3) {
                 pushTriUntex(bucket, p.vertices[0], p.vertices[1],
@@ -640,21 +704,24 @@ struct Renderer {
             }
         }
         // Opaque pass first.
-        glDisable(GL_BLEND);
+        configureBlendForMode(vj::BlendMode::Opaque);
         submitUntex(verts, viewportX, viewportY, viewportW, viewportH);
-        // Semi-transparent pass. PS1 Average mode = (B + F) / 2; emulate
-        // by drawing F with alpha 0.5 over B. The fragment colour
-        // already carries vertex alpha; we just need the right blend
-        // function and a forced alpha of 0.5.
-        if (!vertsSemi.empty()) {
-            for (size_t i = 5; i < vertsSemi.size(); i += 6) {
-                vertsSemi[i] = 0.5f;
-            }
-            glEnable(GL_BLEND);
-            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-            submitUntex(vertsSemi, viewportX, viewportY, viewportW, viewportH);
-            glDisable(GL_BLEND);
-        }
+        // Semi-transparent passes. Each bucket has its own forced vertex
+        // alpha and blend equation so the PS1 mix factor lands correctly.
+        // stride = 6 floats per vertex; alpha is at offset 5.
+        auto drawBucket = [&](std::vector<float>& buf, vj::BlendMode mode) {
+            if (buf.empty()) return;
+            const float a = configureBlendForMode(mode);
+            for (size_t i = 5; i < buf.size(); i += 6) buf[i] = a;
+            submitUntex(buf, viewportX, viewportY, viewportW, viewportH);
+        };
+        drawBucket(vertsAverage,     vj::BlendMode::Average);
+        drawBucket(vertsAdditive,    vj::BlendMode::Additive);
+        drawBucket(vertsSubtractive, vj::BlendMode::Subtractive);
+        drawBucket(vertsAddQuarter,  vj::BlendMode::AdditiveQuarter);
+        // Restore default state so callers downstream get GL_FUNC_ADD.
+        configureBlendForMode(vj::BlendMode::Opaque);
+        vjgl_BlendEquation(GL_FUNC_ADD);
         return drawn;
     }
 
@@ -731,7 +798,10 @@ struct Renderer {
         vjgl_BindVertexArray(0);
     }
 
-    std::vector<float> texVertsSemi;
+    std::vector<float> texVertsAverage;
+    std::vector<float> texVertsAdditive;
+    std::vector<float> texVertsSubtractive;
+    std::vector<float> texVertsAddQuarter;
 
     // Per-frame statistics on textured primitives by TP mode. Reset by
     // drawTextured() each call.
@@ -745,7 +815,10 @@ struct Renderer {
                      float colorMul = 1.0f,
                      float uvRelocateX = 0.0f) {
         texVerts.clear();
-        texVertsSemi.clear();
+        texVertsAverage.clear();
+        texVertsAdditive.clear();
+        texVertsSubtractive.clear();
+        texVertsAddQuarter.clear();
         paletteAtlasBuf.clear();
         paletteAtlasRows = 0;
         statDirectPrims = stat4bppPrims = stat8bppPrims = 0;
@@ -784,8 +857,10 @@ struct Renderer {
                             p.palette.size() * sizeof(uint16_t));
                 ++paletteAtlasRows;
             }
-            std::vector<float>& bucket =
-                (p.blendMode == vj::BlendMode::Opaque) ? texVerts : texVertsSemi;
+            std::vector<float>* semi =
+                semiBucketFor(p.blendMode, texVertsAverage, texVertsAdditive,
+                              texVertsSubtractive, texVertsAddQuarter);
+            std::vector<float>& bucket = semi ? *semi : texVerts;
             if (p.kind == vj::PrimitiveKind::Triangle && p.vertices.size() >= 3) {
                 pushTriTex(bucket, p.vertices[0], p.vertices[1], p.vertices[2],
                            TPageBaseX, TPageBaseY, clutBaseX, clutBaseY,
@@ -811,19 +886,21 @@ struct Renderer {
                          paletteAtlasBuf.data());
             paletteAtlasUploadedRows = paletteAtlasRows;
         }
-        glDisable(GL_BLEND);
+        configureBlendForMode(vj::BlendMode::Opaque);
         submitTex(texVerts, viewportX, viewportY, viewportW, viewportH);
-        if (!texVertsSemi.empty()) {
-            // Force alpha 0.5 on the semi-transparent bucket (PS1 Average).
-            // Stride = 15 floats; alpha index within each vertex is 7.
-            for (size_t i = 7; i < texVertsSemi.size(); i += 15) {
-                texVertsSemi[i] = 0.5f;
-            }
-            glEnable(GL_BLEND);
-            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-            submitTex(texVertsSemi, viewportX, viewportY, viewportW, viewportH);
-            glDisable(GL_BLEND);
-        }
+        // Semi-transparent buckets — stride = 15 floats; alpha is at offset 7.
+        auto drawTexBucket = [&](std::vector<float>& buf, vj::BlendMode mode) {
+            if (buf.empty()) return;
+            const float a = configureBlendForMode(mode);
+            for (size_t i = 7; i < buf.size(); i += 15) buf[i] = a;
+            submitTex(buf, viewportX, viewportY, viewportW, viewportH);
+        };
+        drawTexBucket(texVertsAverage,     vj::BlendMode::Average);
+        drawTexBucket(texVertsAdditive,    vj::BlendMode::Additive);
+        drawTexBucket(texVertsSubtractive, vj::BlendMode::Subtractive);
+        drawTexBucket(texVertsAddQuarter,  vj::BlendMode::AdditiveQuarter);
+        configureBlendForMode(vj::BlendMode::Opaque);
+        vjgl_BlendEquation(GL_FUNC_ADD);
         return drawn;
     }
 

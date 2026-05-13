@@ -85,6 +85,18 @@ typedef void   (VJGL_APIENTRY *PFNGLENABLEVERTEXATTRIBARRAYPROC_)(GLuint);
 typedef void   (VJGL_APIENTRY *PFNGLACTIVETEXTUREPROC_)(GLenum);
 typedef void   (VJGL_APIENTRY *PFNGLUNIFORM1IPROC_)(GLint, GLint);
 typedef void   (VJGL_APIENTRY *PFNGLUNIFORM1FPROC_)(GLint, GLfloat);
+typedef void   (VJGL_APIENTRY *PFNGLBLENDEQUATIONPROC_)(GLenum);
+
+// PS1 ABR sub-modes need glBlendEquation (OpenGL 1.4) to switch between
+// FUNC_ADD and FUNC_REVERSE_SUBTRACT. These tokens aren't always pulled
+// in by the Windows opengl32 header; defining them explicitly keeps the
+// minimal loader self-contained.
+#ifndef GL_FUNC_ADD
+#define GL_FUNC_ADD              0x8006
+#endif
+#ifndef GL_FUNC_REVERSE_SUBTRACT
+#define GL_FUNC_REVERSE_SUBTRACT 0x800B
+#endif
 
 extern PFNGLCREATESHADERPROC_            vjgl_CreateShader;
 extern PFNGLSHADERSOURCEPROC_            vjgl_ShaderSource;
@@ -113,6 +125,7 @@ extern PFNGLENABLEVERTEXATTRIBARRAYPROC_ vjgl_EnableVertexAttribArray;
 extern PFNGLACTIVETEXTUREPROC_           vjgl_ActiveTexture;
 extern PFNGLUNIFORM1IPROC_               vjgl_Uniform1i;
 extern PFNGLUNIFORM1FPROC_               vjgl_Uniform1f;
+extern PFNGLBLENDEQUATIONPROC_           vjgl_BlendEquation;
 
 // Load all extern pointers via glfwGetProcAddress. Returns false if any
 // look-up fails.
