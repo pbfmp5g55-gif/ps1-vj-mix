@@ -37,7 +37,10 @@ constexpr int kVRAMWidth  = 1024;
 constexpr int kVRAMHeight = 512;
 
 // Unpack the on-wire Primitive layout (matches packPrimitiveForLive in
-// the pcsx-redux fork: kind/textured/vc/blend + 8-byte hostTag + N*20).
+// the pcsx-redux fork: kind/textured/vc/blend + 8-byte hostTag + N*20 +
+// paletteKind byte + optional palette[16|256]*2 bytes). The trailing
+// palette is optional: streams that pre-date inline palettes simply
+// have no bytes past the vertex array, and we leave p.palette empty.
 bool unpackLivePrimitive(const uint8_t* buf, size_t len, vj::Primitive& p) {
     if (len < 12) return false;
     p.kind     = static_cast<vj::PrimitiveKind>(buf[0]);
@@ -59,6 +62,20 @@ bool unpackLivePrimitive(const uint8_t* buf, size_t len, vj::Primitive& p) {
         v.g = buf[off++];
         v.b = buf[off++];
         v.a = buf[off++];
+    }
+    p.palette.clear();
+    if (off < len) {
+        const uint8_t paletteKind = buf[off++];
+        size_t entries = 0;
+        if (paletteKind == 1)      entries = 16;
+        else if (paletteKind == 2) entries = 256;
+        // Unknown paletteKind: leave palette empty rather than rejecting
+        // the whole primitive — the renderer just falls back to whatever
+        // CLUT mode the user picked that doesn't need a palette.
+        if (entries > 0 && off + entries * 2 <= len) {
+            p.palette.resize(entries);
+            std::memcpy(p.palette.data(), buf + off, entries * 2);
+        }
     }
     return true;
 }
@@ -170,6 +187,7 @@ layout(location = 3) in float a_clut_kind;
 layout(location = 4) in float a_hash;
 layout(location = 5) in vec2  a_tpage_base; // VRAM pixel coords
 layout(location = 6) in vec2  a_clut_base;  // VRAM pixel coords
+layout(location = 7) in float a_palette_row;// row in u_palette_atlas, -1 if none
 uniform vec2 u_psx_size;
 out vec2 v_uv_raw;
 out vec4 v_color;
@@ -177,18 +195,20 @@ flat out int   v_clut_kind;
 flat out float v_hash;
 flat out vec2  v_tpage_base;
 flat out vec2  v_clut_base;
+flat out float v_palette_row;
 void main() {
     vec2 ndc = vec2(
         (a_pos.x / u_psx_size.x) * 2.0 - 1.0,
         1.0 - (a_pos.y / u_psx_size.y) * 2.0
     );
     gl_Position = vec4(ndc, 0.0, 1.0);
-    v_uv_raw     = a_uv_raw;
-    v_color      = a_color;
-    v_clut_kind  = int(a_clut_kind);
-    v_hash       = a_hash;
-    v_tpage_base = a_tpage_base;
-    v_clut_base  = a_clut_base;
+    v_uv_raw       = a_uv_raw;
+    v_color        = a_color;
+    v_clut_kind    = int(a_clut_kind);
+    v_hash         = a_hash;
+    v_tpage_base   = a_tpage_base;
+    v_clut_base    = a_clut_base;
+    v_palette_row  = a_palette_row;
 }
 )";
 
@@ -198,10 +218,15 @@ void main() {
 //                      sprites; matches the older renderer's behaviour.)
 //   1 = Discard CLUT  (CLUT prims drawn fully transparent; silhouette feel)
 //   2 = Noise CLUT    (CLUT prims tinted from a per-prim hash; chaos feel)
-//   3 = Clean CLUT    (proper PS1 palette indirect lookup: read the nibble/
-//                      byte index from the texture page, then read the actual
-//                      RGB from the CLUT region of VRAM. This is the only
-//                      mode that reproduces the original game graphics.)
+//   3 = Clean CLUT (VRAM lookup) — PS1 palette indirect lookup against the
+//                      mixer's mirror of VRAM. Drifts dark when the game
+//                      rewrites the CLUT mid-frame.
+//   4 = Shape only    (vertex colour only; ignores texture and palette
+//                      entirely. Safe fallback when palette desync hits.)
+//   5 = Clean CLUT (inline palette) — uses the palette the pcsx-redux fork
+//                      captured at submit time and shipped inline with the
+//                      primitive. No dependence on the mixer's VRAM mirror
+//                      being up to date, so palette desync is impossible.
 const char* kTexFragmentSrc = R"(#version 330 core
 in vec2 v_uv_raw;
 in vec4 v_color;
@@ -209,8 +234,10 @@ flat in int   v_clut_kind;     // 0=direct/15bpp, 1=4bpp CLUT, 2=8bpp CLUT
 flat in float v_hash;
 flat in vec2  v_tpage_base;
 flat in vec2  v_clut_base;
-uniform usampler2D u_vram;     // raw 16-bit PS1 VRAM
-uniform int u_clut_mode;       // 0=direct, 1=discard, 2=noise, 3=clean
+flat in float v_palette_row;   // row in u_palette_atlas, -1 if no inline palette
+uniform usampler2D u_vram;          // raw 16-bit PS1 VRAM
+uniform usampler2D u_palette_atlas; // 256xN palette atlas (frame-rebuilt)
+uniform int u_clut_mode;
 out vec4 frag_color;
 
 vec3 hash3(float h) {
@@ -280,7 +307,9 @@ void main() {
         return;
     }
 
-    // u_clut_mode == 3: Clean palette lookup.
+    // u_clut_mode == 3 (Clean / VRAM lookup) and u_clut_mode == 5
+    // (Clean / inline palette) share the index-resolution step; only the
+    // final palette fetch differs.
     uint idx;
     if (v_clut_kind == 1) {
         // 4bpp: 4 nibbles per 16-bit VRAM pixel.
@@ -295,9 +324,19 @@ void main() {
         uint raw = texelFetch(u_vram, ivec2(vramX, tpy + psxV), 0).r;
         idx = (raw >> uint(shift)) & 0xFFu;
     }
-    int cx = int(v_clut_base.x);
-    int cy = int(v_clut_base.y);
-    uint pal = texelFetch(u_vram, ivec2(cx + int(idx), cy), 0).r;
+    uint pal;
+    if (u_clut_mode == 5) {
+        // Inline palette: fall back to discard if the producer didn't ship
+        // a palette for this prim (paletteKind=0 path on the wire). The
+        // mixer assigns row=-1 in that case.
+        int row = int(v_palette_row);
+        if (row < 0) discard;
+        pal = texelFetch(u_palette_atlas, ivec2(int(idx), row), 0).r;
+    } else {
+        int cx = int(v_clut_base.x);
+        int cy = int(v_clut_base.y);
+        pal = texelFetch(u_vram, ivec2(cx + int(idx), cy), 0).r;
+    }
     vec4 c = decodePSX(pal);
     if (c.a < 0.5) discard;
     frag_color = vec4(min(c.rgb * v_color.rgb * 2.0, vec3(1.0)),
@@ -320,10 +359,18 @@ struct Renderer {
     GLint  texUPsxSize  = -1;
     GLint  texUVramSize = -1;
     GLint  texUSampler  = -1;
+    GLint  texUPaletteAtlas = -1;
     GLuint vramTex      = 0;
-    std::vector<float> texVerts;  // x,y,u,v,r,g,b,a per vertex
+    GLuint paletteAtlasTex = 0;
+    std::vector<float> texVerts;  // x,y,u,v,r,g,b,a, clut_kind, hash, tpage_base*2, clut_base*2, palette_row
     // Persistent CPU-side mirror so we can re-upload after a GL reset.
     std::vector<uint16_t> vramMirror;  // kVRAMWidth*kVRAMHeight raw 16-bit pixels
+    // Per-frame palette atlas: 256 entries per row, one row per textured
+    // primitive that carried an inline palette. Indexed by `v_palette_row`
+    // in the fragment shader. Rebuilt every drawTextured() call.
+    std::vector<uint16_t> paletteAtlasBuf;
+    int                   paletteAtlasRows = 0;
+    int                   paletteAtlasUploadedRows = 0;  // last uploaded size
 
     GLuint compileShader(GLenum type, const char* src) {
         GLuint sh = vjgl_CreateShader(type);
@@ -388,8 +435,9 @@ struct Renderer {
         vjgl_GenBuffers(1, &texVbo);
         vjgl_BindVertexArray(texVao);
         vjgl_BindBuffer(GL_ARRAY_BUFFER, texVbo);
-        // Vertex layout: x,y, u,v, r,g,b,a, clut_kind, hash  = 10 floats
-        constexpr GLsizei kTexStride = 14 * sizeof(float);
+        // Vertex layout: pos(2) uv(2) color(4) clut_kind(1) hash(1)
+        //                tpage_base(2) clut_base(2) palette_row(1) = 15 floats
+        constexpr GLsizei kTexStride = 15 * sizeof(float);
         vjgl_VertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, kTexStride,
                                  reinterpret_cast<void*>(0));
         vjgl_EnableVertexAttribArray(0);
@@ -411,6 +459,9 @@ struct Renderer {
         vjgl_VertexAttribPointer(6, 2, GL_FLOAT, GL_FALSE, kTexStride,
                                  reinterpret_cast<void*>(12 * sizeof(float)));
         vjgl_EnableVertexAttribArray(6);
+        vjgl_VertexAttribPointer(7, 1, GL_FLOAT, GL_FALSE, kTexStride,
+                                 reinterpret_cast<void*>(14 * sizeof(float)));
+        vjgl_EnableVertexAttribArray(7);
         vjgl_BindVertexArray(0);
 
         // VRAM texture: raw 16-bit PS1 VRAM as R16UI so the shader can pull
@@ -424,6 +475,21 @@ struct Renderer {
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
         glTexImage2D(GL_TEXTURE_2D, 0, GL_R16UI, kVRAMWidth, kVRAMHeight, 0,
                      GL_RED_INTEGER, GL_UNSIGNED_SHORT, vramMirror.data());
+
+        // Palette atlas: 256xN texture, rebuilt each frame from per-prim
+        // inline palettes. Allocated with one dummy row so the shader's
+        // sampler always has a valid texture bound even before the first
+        // textured frame arrives.
+        glGenTextures(1, &paletteAtlasTex);
+        glBindTexture(GL_TEXTURE_2D, paletteAtlasTex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        std::vector<uint16_t> zeroRow(256, 0);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_R16UI, 256, 1, 0,
+                     GL_RED_INTEGER, GL_UNSIGNED_SHORT, zeroRow.data());
+        paletteAtlasUploadedRows = 1;
 
         return true;
     }
@@ -552,7 +618,8 @@ struct Renderer {
                            float TPageBaseX, float TPageBaseY,
                            float clutBaseX, float clutBaseY,
                            float colorMul,
-                           float clutKind, float primHash) {
+                           float clutKind, float primHash,
+                           float paletteRow) {
         auto push = [&](const vj::Vertex& v) {
             out.push_back(v.x);
             out.push_back(v.y);
@@ -570,12 +637,13 @@ struct Renderer {
             out.push_back(TPageBaseY);
             out.push_back(clutBaseX);
             out.push_back(clutBaseY);
+            out.push_back(paletteRow);
         };
         push(a); push(b); push(c);
     }
 
     GLint texUClutMode = -1;
-    int   clutMode = 0;  // 0=Direct, 1=Discard, 2=Noise
+    int   clutMode = 0;  // 0=Direct 1=Discard 2=Noise 3=Clean(VRAM) 4=Shape 5=Clean(inline)
 
     void submitTex(const std::vector<float>& buf, int viewportX, int viewportY,
                    int viewportW, int viewportH) {
@@ -589,16 +657,26 @@ struct Renderer {
         if (texUClutMode < 0) {
             texUClutMode = vjgl_GetUniformLocation(texProgram, "u_clut_mode");
         }
+        if (texUPaletteAtlas < 0) {
+            texUPaletteAtlas =
+                vjgl_GetUniformLocation(texProgram, "u_palette_atlas");
+        }
         vjgl_Uniform1i(texUClutMode, clutMode);
         vjgl_ActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, vramTex);
         vjgl_Uniform1i(texUSampler, 0);
+        // GL_TEXTURE1 isn't pulled in by our minimal loader; spec guarantees
+        // GL_TEXTUREi == GL_TEXTURE0 + i for the contiguous texture units.
+        vjgl_ActiveTexture(GL_TEXTURE0 + 1);
+        glBindTexture(GL_TEXTURE_2D, paletteAtlasTex);
+        vjgl_Uniform1i(texUPaletteAtlas, 1);
+        vjgl_ActiveTexture(GL_TEXTURE0);  // restore default
         vjgl_BindVertexArray(texVao);
         vjgl_BindBuffer(GL_ARRAY_BUFFER, texVbo);
         vjgl_BufferData(GL_ARRAY_BUFFER,
                         static_cast<GLsizeiptr_compat>(buf.size() * sizeof(float)),
                         buf.data(), GL_DYNAMIC_DRAW);
-        glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(buf.size() / 14));
+        glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(buf.size() / 15));
         vjgl_BindVertexArray(0);
     }
 
@@ -617,6 +695,8 @@ struct Renderer {
                      float uvRelocateX = 0.0f) {
         texVerts.clear();
         texVertsSemi.clear();
+        paletteAtlasBuf.clear();
+        paletteAtlasRows = 0;
         statDirectPrims = stat4bppPrims = stat8bppPrims = 0;
         int drawn = 0;
         for (const auto& p : prims) {
@@ -639,29 +719,53 @@ struct Renderer {
             const float primHash =
                 static_cast<float>(static_cast<uint32_t>(p.hostTag * 2654435761u) & 0xFFFF) /
                 65535.0f;
+            // Inline palette: pack into the per-frame atlas. The shader's
+            // 4bpp path only ever reads entries 0..15, so 16-entry palettes
+            // can share a 256-wide row with the high entries left zero.
+            float paletteRow = -1.0f;
+            if ((p.palette.size() == 16 || p.palette.size() == 256) &&
+                (clutKind == 1.0f || clutKind == 2.0f)) {
+                paletteRow = static_cast<float>(paletteAtlasRows);
+                const size_t base =
+                    static_cast<size_t>(paletteAtlasRows) * 256u;
+                paletteAtlasBuf.resize(base + 256, 0);
+                std::memcpy(&paletteAtlasBuf[base], p.palette.data(),
+                            p.palette.size() * sizeof(uint16_t));
+                ++paletteAtlasRows;
+            }
             std::vector<float>& bucket =
                 (p.blendMode == vj::BlendMode::Opaque) ? texVerts : texVertsSemi;
             if (p.kind == vj::PrimitiveKind::Triangle && p.vertices.size() >= 3) {
                 pushTriTex(bucket, p.vertices[0], p.vertices[1], p.vertices[2],
                            TPageBaseX, TPageBaseY, clutBaseX, clutBaseY,
-                           colorMul, clutKind, primHash);
+                           colorMul, clutKind, primHash, paletteRow);
                 ++drawn;
             } else if (p.kind == vj::PrimitiveKind::Quad && p.vertices.size() >= 4) {
                 pushTriTex(bucket, p.vertices[0], p.vertices[1], p.vertices[2],
                            TPageBaseX, TPageBaseY, clutBaseX, clutBaseY,
-                           colorMul, clutKind, primHash);
+                           colorMul, clutKind, primHash, paletteRow);
                 pushTriTex(bucket, p.vertices[1], p.vertices[3], p.vertices[2],
                            TPageBaseX, TPageBaseY, clutBaseX, clutBaseY,
-                           colorMul, clutKind, primHash);
+                           colorMul, clutKind, primHash, paletteRow);
                 ++drawn;
             }
+        }
+        // Upload the freshly-built palette atlas. glTexImage2D forces a
+        // reallocation, which is what we want when the row count changes
+        // between frames; glTexSubImage2D would silently leave stale rows.
+        if (paletteAtlasRows > 0) {
+            glBindTexture(GL_TEXTURE_2D, paletteAtlasTex);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_R16UI, 256, paletteAtlasRows, 0,
+                         GL_RED_INTEGER, GL_UNSIGNED_SHORT,
+                         paletteAtlasBuf.data());
+            paletteAtlasUploadedRows = paletteAtlasRows;
         }
         glDisable(GL_BLEND);
         submitTex(texVerts, viewportX, viewportY, viewportW, viewportH);
         if (!texVertsSemi.empty()) {
             // Force alpha 0.5 on the semi-transparent bucket (PS1 Average).
-            // Stride = 14 floats; alpha index within each vertex is 7.
-            for (size_t i = 7; i < texVertsSemi.size(); i += 14) {
+            // Stride = 15 floats; alpha index within each vertex is 7.
+            for (size_t i = 7; i < texVertsSemi.size(); i += 15) {
                 texVertsSemi[i] = 0.5f;
             }
             glEnable(GL_BLEND);
@@ -680,9 +784,10 @@ struct Renderer {
         if (texVao) vjgl_DeleteVertexArrays(1, &texVao);
         if (texProgram) vjgl_DeleteProgram(texProgram);
         if (vramTex) glDeleteTextures(1, &vramTex);
+        if (paletteAtlasTex) glDeleteTextures(1, &paletteAtlasTex);
         vbo = vao = texVbo = texVao = 0;
         program = texProgram = 0;
-        vramTex = 0;
+        vramTex = paletteAtlasTex = 0;
     }
 };
 
@@ -829,8 +934,8 @@ int main() {
         if (c >= 0) {
             // 5 CLUT modes: 0..127 -> 0..4 in 5 even bands (~26 CC values
             // each). Mode 0=Direct 1=Discard 2=Noise 3=Clean 4=ShapeOnly.
-            int m = (c * 5) / 128;
-            if (m > 4) m = 4;
+            int m = (c * 6) / 128;
+            if (m > 5) m = 5;
             renderer.clutMode = m;
         }
         const int x = midi->getCC(crossfadeCC);
@@ -1038,10 +1143,11 @@ int main() {
                 "Direct sample (CLUT looks black)",
                 "Discard CLUT (silhouette)",
                 "Noise CLUT (per-prim hash color)",
-                "Clean CLUT (proper palette lookup)",
-                "Shape only (vertex color, ignore palette)"
+                "Clean CLUT (VRAM lookup)",
+                "Shape only (vertex color, ignore palette)",
+                "Clean CLUT (inline palette)"
             };
-            ImGui::Combo("CLUT mode", &renderer.clutMode, clutModes, 5);
+            ImGui::Combo("CLUT mode", &renderer.clutMode, clutModes, 6);
             ImGui::Text("Last frame: direct=%d  4bpp=%d  8bpp=%d",
                         renderer.statDirectPrims,
                         renderer.stat4bppPrims,
@@ -1325,7 +1431,7 @@ int main() {
             bindingRow("Twin delay frames",  &twinDelayCC,  1, "(maps 0..127 -> 1..300)");
             bindingRow("Twin ghost bright",  &twinAlphaCC,  2, "(maps 0..127 -> 0..1)");
             ImGui::TextUnformatted("Phase B / C CC bindings:");
-            bindingRow("CLUT mode",          &clutModeCC,   3, "(5 bands: Direct/Discard/Noise/Clean/Shape)");
+            bindingRow("CLUT mode",          &clutModeCC,   3, "(6 bands: Direct/Discard/Noise/Clean(VRAM)/Shape/Clean(inline))");
             bindingRow("Crossfade A<->B",    &crossfadeCC,  4, "(0..127 -> 0..1)");
             bindingRow("B VRAM relocate",    &relocateCC,   5, "(0..127 -> 0..512, B chaos vs C clean)");
 
