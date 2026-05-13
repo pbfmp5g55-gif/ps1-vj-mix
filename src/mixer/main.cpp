@@ -168,10 +168,29 @@ void main() {
 }
 )";
 
+// PS1 GPU itself ordered-dithers 24bpp internal colour down to 15bpp
+// output (5/5/5), producing the characteristic 2x2-ish noise pattern on
+// gradients. The mixer runs at full 8bpp per channel so we reapply the
+// effect ourselves to get "the PS1 look" back. u_dither_strength=0 is
+// a no-op fast path (matches the historical mixer behaviour).
 const char* kFragmentSrc = R"(#version 330 core
 in vec4 v_color;
 out vec4 frag_color;
-void main() { frag_color = v_color; }
+const float kBayer4[16] = float[16](
+     0.0/16.0,  8.0/16.0,  2.0/16.0, 10.0/16.0,
+    12.0/16.0,  4.0/16.0, 14.0/16.0,  6.0/16.0,
+     3.0/16.0, 11.0/16.0,  1.0/16.0,  9.0/16.0,
+    15.0/16.0,  7.0/16.0, 13.0/16.0,  5.0/16.0
+);
+uniform float u_dither_strength;
+vec3 applyDither(vec3 c) {
+    if (u_dither_strength <= 0.0) return c;
+    int x = int(gl_FragCoord.x) & 3;
+    int y = int(gl_FragCoord.y) & 3;
+    float t = kBayer4[y*4 + x] - 0.5;
+    return clamp(c + vec3(t * u_dither_strength * (1.0 / 32.0)), 0.0, 1.0);
+}
+void main() { frag_color = vec4(applyDither(v_color.rgb), v_color.a); }
 )";
 
 // Textured pipeline: per-vertex packs pos / raw PS1 texel u,v / vertex colour
@@ -238,7 +257,25 @@ flat in float v_palette_row;   // row in u_palette_atlas, -1 if no inline palett
 uniform usampler2D u_vram;          // raw 16-bit PS1 VRAM
 uniform usampler2D u_palette_atlas; // 256xN palette atlas (frame-rebuilt)
 uniform int u_clut_mode;
+uniform float u_dither_strength;
 out vec4 frag_color;
+
+// 4x4 ordered Bayer dither — see the untextured pipeline for the rationale.
+// Each colour path below routes through applyDither so the effect lands on
+// every fragment regardless of CLUT mode / texture path.
+const float kBayer4[16] = float[16](
+     0.0/16.0,  8.0/16.0,  2.0/16.0, 10.0/16.0,
+    12.0/16.0,  4.0/16.0, 14.0/16.0,  6.0/16.0,
+     3.0/16.0, 11.0/16.0,  1.0/16.0,  9.0/16.0,
+    15.0/16.0,  7.0/16.0, 13.0/16.0,  5.0/16.0
+);
+vec3 applyDither(vec3 c) {
+    if (u_dither_strength <= 0.0) return c;
+    int x = int(gl_FragCoord.x) & 3;
+    int y = int(gl_FragCoord.y) & 3;
+    float t = kBayer4[y*4 + x] - 0.5;
+    return clamp(c + vec3(t * u_dither_strength * (1.0 / 32.0)), 0.0, 1.0);
+}
 
 vec3 hash3(float h) {
     return fract(vec3(
@@ -272,7 +309,8 @@ void main() {
         if (c.a < 0.5) discard;
         // PS1 modulation: vertex colour 0x80 means "unmodulated" (texture
         // passes through), not 50%. Multiply by 2 and clamp so 0x80 → 1.0×.
-        frag_color = vec4(min(c.rgb * v_color.rgb * 2.0, vec3(1.0)), c.a * v_color.a);
+        vec3 rgb = min(c.rgb * v_color.rgb * 2.0, vec3(1.0));
+        frag_color = vec4(applyDither(rgb), c.a * v_color.a);
         return;
     }
 
@@ -286,14 +324,14 @@ void main() {
         vec3 col = hash3(h);
         float m = max(max(col.r, col.g), col.b);
         if (m > 0.0) col /= m;
-        frag_color = vec4(col, 1.0);
+        frag_color = vec4(applyDither(col), 1.0);
         return;
     }
     if (u_clut_mode == 4) {
         // Shape only: ignore palette / texture, render the polygon with the
         // game's gouraud-shaded vertex colour. Works no matter what state
         // the VRAM mirror is in — palette desync never blacks out the prim.
-        frag_color = vec4(v_color.rgb, 1.0);
+        frag_color = vec4(applyDither(v_color.rgb), 1.0);
         return;
     }
     if (u_clut_mode == 0) {
@@ -302,8 +340,8 @@ void main() {
         uint raw = texelFetch(u_vram, ivec2(tpx + psxU, tpy + psxV), 0).r;
         vec4 c = decodePSX(raw);
         if (c.a < 0.5) discard;
-        frag_color = vec4(min(c.rgb * v_color.rgb * 2.0, vec3(1.0)),
-                          c.a * v_color.a);
+        vec3 rgb = min(c.rgb * v_color.rgb * 2.0, vec3(1.0));
+        frag_color = vec4(applyDither(rgb), c.a * v_color.a);
         return;
     }
 
@@ -339,8 +377,8 @@ void main() {
     }
     vec4 c = decodePSX(pal);
     if (c.a < 0.5) discard;
-    frag_color = vec4(min(c.rgb * v_color.rgb * 2.0, vec3(1.0)),
-                      c.a * v_color.a);
+    vec3 rgb = min(c.rgb * v_color.rgb * 2.0, vec3(1.0));
+    frag_color = vec4(applyDither(rgb), c.a * v_color.a);
 }
 )";
 
@@ -350,6 +388,7 @@ struct Renderer {
     GLuint vao     = 0;
     GLuint vbo     = 0;
     GLint  uPsxSize = -1;
+    GLint  uDitherStrength = -1;
     std::vector<float> verts;  // x,y,r,g,b,a per vertex
 
     // Textured pipeline.
@@ -371,6 +410,11 @@ struct Renderer {
     std::vector<uint16_t> paletteAtlasBuf;
     int                   paletteAtlasRows = 0;
     int                   paletteAtlasUploadedRows = 0;  // last uploaded size
+
+    // PS1 ordered-dither emulation, 0..1 (0 = off). Applied in both the
+    // untextured and textured fragment shaders.
+    float ditherStrength = 0.0f;
+    GLint texUDitherStrength = -1;
 
     GLuint compileShader(GLenum type, const char* src) {
         GLuint sh = vjgl_CreateShader(type);
@@ -411,6 +455,7 @@ struct Renderer {
         program = linkProgram(kVertexSrc, kFragmentSrc);
         if (!program) return false;
         uPsxSize = vjgl_GetUniformLocation(program, "u_psx_size");
+        uDitherStrength = vjgl_GetUniformLocation(program, "u_dither_strength");
 
         vjgl_GenVertexArrays(1, &vao);
         vjgl_GenBuffers(1, &vbo);
@@ -556,6 +601,7 @@ struct Renderer {
         vjgl_UseProgram(program);
         vjgl_Uniform2f(uPsxSize, static_cast<float>(kPS1Width),
                        static_cast<float>(kPS1Height));
+        vjgl_Uniform1f(uDitherStrength, ditherStrength);
         vjgl_BindVertexArray(vao);
         vjgl_BindBuffer(GL_ARRAY_BUFFER, vbo);
         vjgl_BufferData(GL_ARRAY_BUFFER,
@@ -661,7 +707,12 @@ struct Renderer {
             texUPaletteAtlas =
                 vjgl_GetUniformLocation(texProgram, "u_palette_atlas");
         }
+        if (texUDitherStrength < 0) {
+            texUDitherStrength =
+                vjgl_GetUniformLocation(texProgram, "u_dither_strength");
+        }
         vjgl_Uniform1i(texUClutMode, clutMode);
+        vjgl_Uniform1f(texUDitherStrength, ditherStrength);
         vjgl_ActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, vramTex);
         vjgl_Uniform1i(texUSampler, 0);
@@ -1152,6 +1203,8 @@ int main() {
                         renderer.statDirectPrims,
                         renderer.stat4bppPrims,
                         renderer.stat8bppPrims);
+            ImGui::SliderFloat("Dithering", &renderer.ditherStrength, 0.0f, 1.0f,
+                               "%.2f");
             ImGui::Separator();
 
             ImGui::TextUnformatted("libvj effects on the mixed stream:");

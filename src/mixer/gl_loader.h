@@ -84,6 +84,7 @@ typedef void   (VJGL_APIENTRY *PFNGLVERTEXATTRIBPOINTERPROC_)(GLuint, GLint, GLe
 typedef void   (VJGL_APIENTRY *PFNGLENABLEVERTEXATTRIBARRAYPROC_)(GLuint);
 typedef void   (VJGL_APIENTRY *PFNGLACTIVETEXTUREPROC_)(GLenum);
 typedef void   (VJGL_APIENTRY *PFNGLUNIFORM1IPROC_)(GLint, GLint);
+typedef void   (VJGL_APIENTRY *PFNGLUNIFORM1FPROC_)(GLint, GLfloat);
 
 extern PFNGLCREATESHADERPROC_            vjgl_CreateShader;
 extern PFNGLSHADERSOURCEPROC_            vjgl_ShaderSource;
@@ -111,6 +112,7 @@ extern PFNGLVERTEXATTRIBPOINTERPROC_     vjgl_VertexAttribPointer;
 extern PFNGLENABLEVERTEXATTRIBARRAYPROC_ vjgl_EnableVertexAttribArray;
 extern PFNGLACTIVETEXTUREPROC_           vjgl_ActiveTexture;
 extern PFNGLUNIFORM1IPROC_               vjgl_Uniform1i;
+extern PFNGLUNIFORM1FPROC_               vjgl_Uniform1f;
 
 // Load all extern pointers via glfwGetProcAddress. Returns false if any
 // look-up fails.

@@ -30,6 +30,7 @@ PFNGLVERTEXATTRIBPOINTERPROC_     vjgl_VertexAttribPointer     = nullptr;
 PFNGLENABLEVERTEXATTRIBARRAYPROC_ vjgl_EnableVertexAttribArray = nullptr;
 PFNGLACTIVETEXTUREPROC_           vjgl_ActiveTexture           = nullptr;
 PFNGLUNIFORM1IPROC_               vjgl_Uniform1i               = nullptr;
+PFNGLUNIFORM1FPROC_               vjgl_Uniform1f               = nullptr;
 
 namespace {
 template <typename T>
@@ -71,5 +72,6 @@ bool vjglLoad() {
     vjgl_EnableVertexAttribArray = fetch<PFNGLENABLEVERTEXATTRIBARRAYPROC_>("glEnableVertexAttribArray", ok);
     vjgl_ActiveTexture           = fetch<PFNGLACTIVETEXTUREPROC_>("glActiveTexture", ok);
     vjgl_Uniform1i               = fetch<PFNGLUNIFORM1IPROC_>("glUniform1i", ok);
+    vjgl_Uniform1f               = fetch<PFNGLUNIFORM1FPROC_>("glUniform1f", ok);
     return ok;
 }
