@@ -921,7 +921,21 @@ struct Renderer {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    // --attach-a <name> / --attach-b <name>: auto-attach Channel A/B to the
+    // given shared-memory ring at startup. Pairs with pcsx-redux -vjring so
+    // a single launcher script can spin up both emulators + the mixer with
+    // IPC already connected.
+    const char* cliAttachA = nullptr;
+    const char* cliAttachB = nullptr;
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--attach-a") == 0 && i + 1 < argc) {
+            cliAttachA = argv[++i];
+        } else if (std::strcmp(argv[i], "--attach-b") == 0 && i + 1 < argc) {
+            cliAttachB = argv[++i];
+        }
+    }
+
     glfwSetErrorCallback(glfwErrorCallback);
     if (!glfwInit()) {
         std::fprintf(stderr, "glfwInit failed\n");
@@ -1027,6 +1041,20 @@ int main() {
     LiveChannel chA, chB;
     std::strncpy(chA.nameBuf, "Local\\vj-mix-prim-A", sizeof(chA.nameBuf));
     std::strncpy(chB.nameBuf, "Local\\vj-mix-prim-B", sizeof(chB.nameBuf));
+    if (cliAttachA) {
+        std::strncpy(chA.nameBuf, cliAttachA, sizeof(chA.nameBuf) - 1);
+        chA.nameBuf[sizeof(chA.nameBuf) - 1] = '\0';
+        if (!chA.reader.open(chA.nameBuf)) {
+            std::fprintf(stderr, "[mixer] auto-attach A failed: %s\n", chA.nameBuf);
+        }
+    }
+    if (cliAttachB) {
+        std::strncpy(chB.nameBuf, cliAttachB, sizeof(chB.nameBuf) - 1);
+        chB.nameBuf[sizeof(chB.nameBuf) - 1] = '\0';
+        if (!chB.reader.open(chB.nameBuf)) {
+            std::fprintf(stderr, "[mixer] auto-attach B failed: %s\n", chB.nameBuf);
+        }
+    }
     std::vector<uint8_t> liveRecBuf;
     // 2 MB receive buffer — fits a full 1024x512 VRAM snapshot (which
     // pcsx-redux v0.7.4+ sends on live::start as up to four 1024x128
