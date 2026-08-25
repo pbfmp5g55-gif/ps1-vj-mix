@@ -48,10 +48,14 @@ async function get(p) {
   const control = dgram.createSocket('udp4');
   await new Promise((r) => control.bind(0, '127.0.0.1', r));
   let controlSeq = 0;
+  let heartbeat = { holdArmed: false, windowOpen: true };
   const sendControl = (c) => new Promise((r) => {
-    control.send(pkt.encodeControl(Object.assign({ seq: ++controlSeq }, c)),
+    if (c) heartbeat = c;
+    control.send(pkt.encodeControl(Object.assign({ seq: ++controlSeq }, heartbeat)),
                  CONTROL, '127.0.0.1', r);
   });
+  // Stand in for a running mixer, which sends its controls at 10 Hz.
+  const hbTimer = setInterval(() => { sendControl(null); }, 100);
 
   // ---- start the server ---------------------------------------------------
   const srv = spawn(process.execPath, [path.join(__dirname, '..', 'server.js')], {
@@ -70,8 +74,13 @@ async function get(p) {
   process.on('exit', stop);
 
   await sleep(900);
+  await sleep(400);   // let a few heartbeats land so the window is open
 
   try {
+    const hOnline = await get('/health');
+    check('the server sees the mixer once controls arrive',
+      hOnline.json.mixerOnline === true && hOnline.json.state.windowOpen === true);
+
     // ---- basic liveness ---------------------------------------------------
     const health = await get('/health');
     check('server answers /health', health.status === 200 && health.json && health.json.ok);
@@ -187,10 +196,46 @@ async function get(p) {
     const h6 = await get('/health');
     check('reopening the window works', h6.json.state.windowOpen === true);
 
+    // ---- the mixer going away ---------------------------------------------
+    clearInterval(hbTimer);
+    await sleep(3500);
+    const hGone = await get('/health');
+    check('losing the mixer closes the window instead of hanging on',
+      hGone.json.mixerOnline === false && hGone.json.state.windowOpen === false);
+
+    // ---- a restarted mixer starts its sequence at 0 again ------------------
+    // This is the one that used to lock the link out for the best part of an
+    // hour: the old sequence check rejected everything below what it had seen.
+    controlSeq = 0;
+    await sendControl({ holdArmed: false, windowOpen: true });
+    await sleep(300);
+    await sendControl(null);
+    await sleep(300);
+    const hBack = await get('/health');
+    check('a restarted mixer (seq back to 0) is picked up again',
+      hBack.json.mixerOnline === true && hBack.json.state.windowOpen === true);
+
+    // ---- SSE connections are capped ---------------------------------------
+    const streams = [];
+    let refused = 0;
+    for (let i = 0; i < 6; i++) {
+      const ac = new AbortController();
+      streams.push(ac);
+      try {
+        const r = await fetch(BASE + '/events', { signal: ac.signal });
+        if (r.status === 503) refused++;
+        else r.body.getReader();   // hold it open
+      } catch (e) { /* aborted */ }
+    }
+    check('too many event streams from one address are refused', refused > 0,
+      'refused ' + refused + ' of 6');
+    streams.forEach((a) => { try { a.abort(); } catch (e) {} });
+
   } catch (e) {
     failed++;
     console.log('  FAIL threw: ' + e.stack);
   } finally {
+    clearInterval(hbTimer);
     stop();
     sock.close();
     control.close();

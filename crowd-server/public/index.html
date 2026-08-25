@@ -77,7 +77,7 @@
   var conn = document.getElementById('conn');
   var gauge = document.getElementById('gauge');
 
-  var pending = 0, mineTotal = 0, windowOpen = true, sending = false;
+  var pending = 0, mineTotal = 0, windowOpen = true, sending = false, blocked = false;
   var lastBurst = 0;
 
   function hit() {
@@ -110,10 +110,26 @@
       body: JSON.stringify({ id: id, taps: n }),
       keepalive: true,
     }).then(function (r) { return r.json(); })
-      .then(function () { sending = false; })
+      .then(function (j) {
+        sending = false;
+        // Being turned away has to say so. Silently counting nothing looks
+        // exactly like a broken page from the far side of a dark room.
+        if (j && j.blocked) {
+          blocked = true;
+          conn.textContent = '参加できません(端末数の上限)';
+          conn.className = 'warn';
+        } else if (blocked) {
+          blocked = false;
+          conn.textContent = '';
+          conn.className = '';
+        }
+      })
       .catch(function () {
-        // Put them back so a blip does not silently eat the crowd's effort.
-        pending += n; sending = false;
+        // Drop the batch. Re-queueing looks kinder, but a request that in
+        // fact reached the server and only lost its reply would then be
+        // counted twice. A lost quarter-second is invisible; inflated taps
+        // are not, and there is no batch id to deduplicate with.
+        sending = false;
       });
   }
   setInterval(send, POST_MS);
@@ -135,7 +151,13 @@
     fill.style.width = Math.round(s.charge * 100) + '%';
     windowOpen = s.windowOpen;
     gauge.id = s.held ? 'held' : '';
-    if (!s.windowOpen) {
+    if (blocked) {
+      pad.classList.add('off'); pad.textContent = '参加できません';
+      gtext.textContent = 'FULL';
+    } else if (s.mixerOnline === false) {
+      pad.classList.add('off'); pad.textContent = '準備中';
+      gtext.textContent = 'OFFLINE';
+    } else if (!s.windowOpen) {
       pad.classList.add('off'); pad.textContent = 'まもなく';
       gtext.textContent = 'CLOSED';
     } else {

@@ -72,6 +72,14 @@ Sources
 - **`.vjr` recordings** — open, play/pause, 0.1–4× speed
 - **Twin Self** (past-frame ghost overlay) — *file source only for now*
 
+Audience (CROWD)
+- The room taps a gauge from their phones; it rides on top of whatever the VJ
+  has set, and a full gauge fires a burst. Server, phone page and all the feel
+  tuning live in [`crowd-server/`](crowd-server/README.md) (Node, no npm
+  dependencies); the mixer keeps strength / CUT / HOLD / participation window.
+- A **keyboard test mode** drives the same gauge with no server and no phones,
+  so the look can be judged first. Design: [`design/CROWD_CONTROL.md`](design/CROWD_CONTROL.md).
+
 Control
 - **MIDI in** (RtMidi): port picker, refresh, per-target **Learn**.
   Bound targets: Twin Self enable / delay / brightness, CLUT mode,
@@ -83,7 +91,10 @@ Control
 ## Repo layout
 
 - `src/mixer/` — the central process: `main.cpp` (GUI + render + mix),
-  `ipc/` (shared-memory ring + selftest), `gl_loader.*`
+  `ipc/` (shared-memory ring + selftest), `crowd/` (loopback UDP link to the
+  crowd server), `gl_loader.*`
+- `crowd-server/` — the audience feature's Node side, with its own tests
+- `start-crowd.bat` — brings the crowd server and the mixer up together
 - `third_party/libvj/` — git submodule → `ps1-primitive-vj`
 - `design/` — `ARCHITECTURE.md`, `IPC_PROTOCOL.md`, `GPU_PIPELINE.md`,
   `SPIKE1_PLAN.md`, `SPIKE2_PLAN.md`

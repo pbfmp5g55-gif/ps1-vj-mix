@@ -36,6 +36,11 @@ constexpr uint8_t kFlagCooldown   = 1 << 3;
 constexpr double kHoldSec  = 0.4;
 constexpr double kFadeSec  = 0.6;
 constexpr double kControlIntervalSec = 0.1;
+// A restarted server begins its sequence at 0 again. Rejecting anything not
+// "newer" would then ignore it until the counter climbed past whatever we had
+// already seen — about 25 minutes at 20 Hz. Any real gap in the stream means
+// the next valid packet is the current truth, whatever its number says.
+constexpr double kSeqResyncSec = 1.0;
 
 uint32_t rdU32(const uint8_t* p) {
     return static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
@@ -130,8 +135,15 @@ bool CrowdLink::open(uint16_t listenPort, uint16_t controlPort) {
         closesocket(rx);
         return false;
     }
+    // If this fails the socket stays blocking, and the second recv() in
+    // poll() would park the render thread for good. Refuse to open instead.
     u_long nonblocking = 1;
-    ioctlsocket(rx, FIONBIO, &nonblocking);
+    if (ioctlsocket(rx, FIONBIO, &nonblocking) != 0) {
+        std::snprintf(m_state.error, sizeof(m_state.error),
+                      "could not set non-blocking mode (%d)", WSAGetLastError());
+        closesocket(rx);
+        return false;
+    }
 
     // A separate socket for sending, so the receive socket never triggers an
     // ICMP unreachable against itself.
@@ -143,7 +155,14 @@ bool CrowdLink::open(uint16_t listenPort, uint16_t controlPort) {
         return false;
     }
     disableConnReset(tx);
-    ioctlsocket(tx, FIONBIO, &nonblocking);
+    if (ioctlsocket(tx, FIONBIO, &nonblocking) != 0) {
+        std::snprintf(m_state.error, sizeof(m_state.error),
+                      "could not set control socket non-blocking (%d)",
+                      WSAGetLastError());
+        closesocket(rx);
+        closesocket(tx);
+        return false;
+    }
 
     m_recvSock = static_cast<intptr_t>(rx);
     m_sendSock = static_cast<intptr_t>(tx);
@@ -183,10 +202,15 @@ void CrowdLink::poll(double nowSec) {
             if (rdU32(buf) != kStateMagic)             { ++m_state.dropped; continue; }
             if (buf[4] != kVersion)                    { ++m_state.dropped; continue; }
             const uint16_t seq = rdU16(buf + 6);
-            if (m_lastSeq >= 0 && !seqNewer(seq, static_cast<uint16_t>(m_lastSeq))) {
+            const bool resync =
+                m_state.lastPacketAt < 0.0 ||
+                (nowSec - m_state.lastPacketAt) > kSeqResyncSec;
+            if (!resync && m_lastSeq >= 0 &&
+                !seqNewer(seq, static_cast<uint16_t>(m_lastSeq))) {
                 ++m_state.dropped;
                 continue;
             }
+            if (resync) ++m_state.resyncs;
             m_lastSeq = static_cast<int>(seq);
             const uint8_t flags = buf[5];
             m_state.charge     = clamp01(rdF32(buf + 8));

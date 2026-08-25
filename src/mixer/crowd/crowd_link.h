@@ -32,6 +32,7 @@ struct CrowdState {
     double lastPacketAt = -1.0;
     uint64_t accepted = 0;      // packets applied
     uint64_t dropped  = 0;      // malformed / stale / wrong version
+    uint64_t resyncs  = 0;      // times the sequence was re-based after a gap
     char   error[128] = {0};    // non-empty when the socket could not open
 
     // What the effects should actually use: the received values faded out by

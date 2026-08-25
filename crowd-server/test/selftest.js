@@ -168,6 +168,15 @@ test('one IP cannot farm unlimited device ids', () => {
   assert.strictEqual(allowed, max);
 });
 
+test('a turned-away device is reported, not silently ignored', () => {
+  const g = new Gauge();
+  const max = g.cfg.maxDevicesPerAddr;
+  for (let i = 0; i < max; i++) g.tap('id' + i, 1, 1000, '10.0.0.9');
+  assert.strictEqual(g.deviceBlocked('newcomer', '10.0.0.9'), true);
+  assert.strictEqual(g.deviceBlocked('id0', '10.0.0.9'), false, 'known device blocked');
+  assert.strictEqual(g.deviceBlocked('newcomer', '10.0.0.10'), false, 'other address blocked');
+});
+
 test('active count decays out of the window', () => {
   const g = new Gauge();
   g.tap('a', 3, 1000);
@@ -184,6 +193,61 @@ test('one person leaving does not lurch the divisor', () => {
   s.run(0.1, 5, 5);
   assert.ok(Math.abs(s.g.smoothedActive - before) < 0.5,
     'divisor jumped by ' + Math.abs(s.g.smoothedActive - before).toFixed(2));
+});
+
+test('pruning an idle device frees its per-address slot', () => {
+  // Before the fix the id stayed in the address set forever, so an address
+  // that ever hit the cap could never register another device again.
+  const g = new Gauge();
+  const max = g.cfg.maxDevicesPerAddr;
+  for (let i = 0; i < max; i++) g.tap('id' + i, 1, 1000, '10.0.0.9');
+  assert.strictEqual(g.deviceBlocked('later', '10.0.0.9'), true);
+  g.prune(1000 + 400);   // everyone has been idle well past the 300 s cutoff
+  assert.strictEqual(g.devices.size, 0);
+  assert.strictEqual(g.deviceBlocked('later', '10.0.0.9'), false,
+    'address stayed blocked after its devices were pruned');
+});
+
+test('burst decay cannot be set to zero (it used to stick at full)', () => {
+  const g = new Gauge();
+  g.setParams({ burstDecaySec: 0 });
+  assert.ok(g.cfg.burstDecaySec >= 0.05, 'zero decay accepted');
+  g.burst = 1.0;
+  g.cfg.burstDecaySec = 0;         // force the degenerate case anyway
+  g.tick(0.05, 1000);
+  assert.strictEqual(g.burst, 0, 'a zero decay must drop the burst, not hold it');
+});
+
+test('tuning values are clamped to sane bounds', () => {
+  const g = new Gauge();
+  g.setParams({ baseGain: 1e9, leakRate: -5, cooldownSec: NaN });
+  assert.ok(g.cfg.baseGain <= 1.0 && g.cfg.leakRate >= 0);
+  assert.ok(Number.isFinite(g.cfg.cooldownSec), 'NaN got through');
+});
+
+test('releasing HOLD fires even after the room went quiet', () => {
+  // The crowd fills the gauge, the VJ holds it, then everyone stops tapping
+  // long enough to fall under quorum. Releasing must still land the drop.
+  const s = new Sim();
+  s.g.holdArmed = true;
+  s.run(60, 5, 10);
+  assert.ok(s.g.held, 'setup: gauge should be full and waiting');
+  s.run(s.g.cfg.activeWindowSec + 3, 0, 0);   // everyone stops
+  assert.ok(s.g.activeCount(s.t) < s.g.cfg.quorum, 'setup: should be under quorum');
+  s.g.holdArmed = false;
+  const after = s.run(0.5, 0, 0);
+  assert.ok(after.some((e) => e.fired), 'releasing HOLD did nothing');
+});
+
+test('a fractional or absurd tap claim cannot poison the totals', () => {
+  const g = new Gauge();
+  assert.strictEqual(g.tap('a', 0.5, 1000), 0, 'fractional claim credited');
+  assert.strictEqual(g.tap('b', Infinity, 1000), 0, 'Infinity credited');
+  assert.strictEqual(g.tap('c', '7', 1000), g.cfg.bucketCapacity,
+    'a big finite claim should clamp to the bucket, not be thrown away');
+  assert.ok(Number.isFinite(g.charge));
+  g.tick(0.05, 1000);
+  assert.ok(Number.isFinite(g.charge), 'charge went non-finite');
 });
 
 console.log('wire format');

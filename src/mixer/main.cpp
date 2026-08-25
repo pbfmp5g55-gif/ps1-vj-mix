@@ -1602,10 +1602,11 @@ int main(int argc, char** argv) {
                                        "  waiting for crowd-server (UDP %u)",
                                        static_cast<unsigned>(vjmix::kCrowdListenPort));
                 } else {
-                    ImGui::Text("  %d tapping | pkts %llu | dropped %llu",
+                    ImGui::Text("  %d tapping | pkts %llu | dropped %llu | resync %llu",
                                 cs.active,
                                 static_cast<unsigned long long>(cs.accepted),
-                                static_cast<unsigned long long>(cs.dropped));
+                                static_cast<unsigned long long>(cs.dropped),
+                                static_cast<unsigned long long>(cs.resyncs));
                 }
 
                 ImGui::SetNextItemWidth(-90);
@@ -1631,7 +1632,10 @@ int main(int argc, char** argv) {
                 std::snprintf(gbuf, sizeof(gbuf), "burst %.0f%%", crowdHit * 100.0f);
                 ImGui::ProgressBar(crowdHit, ImVec2(-1, 0), gbuf);
 
-                if (!crowdWindowOpen) {
+                const bool crowdStatusTrustworthy = crowdTestMode || cs.linkAlive();
+                if (!crowdStatusTrustworthy) {
+                    ImGui::TextDisabled("  (no crowd data)");
+                } else if (!crowdWindowOpen) {
                     ImGui::TextDisabled("  participation closed");
                 } else if (!crowdTestMode && cs.held) {
                     ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.2f, 1.0f),
@@ -1803,7 +1807,14 @@ int main(int argc, char** argv) {
                                 effective, crowdLevel, crowdHit, crowdCap,
                                 crowdStage2, crowdAllowMissing);
                         }
-                        vjInterceptor.beginFrame(effective, vjFrameCounter);
+                        // Second argument is the primitive count, not a frame
+                        // number: SafetyLimiter uses it to work out when
+                        // MISSING has dropped so much of the frame that it has
+                        // to force the rest through. Feeding it the ever-rising
+                        // frame counter made that ratio meaningless, so the
+                        // guard never fired and MISSING could empty the screen.
+                        vjInterceptor.beginFrame(effective,
+                                                 static_cast<int>(kept.size()));
                         for (auto& p : kept) vjInterceptor.interceptAndSubmit(p);
                         drawn = &vjPassThruScratch;
                     }
@@ -1842,10 +1853,10 @@ int main(int argc, char** argv) {
                             effective, crowdLevel, crowdHit, crowdCap,
                             crowdStage2, crowdAllowMissing);
                     }
-                    vjInterceptor.beginFrame(effective, vjFrameCounter);
+                    vjInterceptor.beginFrame(
+                        effective, static_cast<int>(fr.primitives.size()));
                     for (const auto& p : fr.primitives) {
-                        vj::Primitive copy = p;
-                        vjInterceptor.interceptAndSubmit(copy);
+                        vjInterceptor.interceptAndSubmit(p);
                     }
                     fileDrawn = &vjPassThruScratch;
                     ++vjFrameCounter;
@@ -1868,8 +1879,13 @@ int main(int argc, char** argv) {
             const float bw = ds.x * 0.8f;
             const float bx = (ds.x - bw) * 0.5f;
             const float by = ds.y - bh - ds.y * 0.05f;
+            // held / inCooldown are latched from the last packet and do not
+            // fade out with freshness, so a dead server would otherwise leave
+            // the projection blinking READY at the room for the rest of the set.
+            const vjmix::CrowdState& gs = crowdLink.state();
+            const bool  liveStatus = crowdTestMode || gs.linkAlive();
             const bool  full = crowdTestMode ? (crowdLevel >= 0.999f)
-                                             : crowdLink.state().held;
+                                             : (liveStatus && gs.held);
             dl->AddRectFilled(ImVec2(bx - 2.0f, by - 2.0f),
                               ImVec2(bx + bw + 2.0f, by + bh + 2.0f),
                               IM_COL32(0, 0, 0, 150), 4.0f);
@@ -1895,9 +1911,11 @@ int main(int argc, char** argv) {
             const char* msg = nullptr;
             if (!crowdWindowOpen) {
                 msg = "CLOSED";
-            } else if (!crowdTestMode && crowdLink.state().inCooldown) {
+            } else if (!crowdTestMode && !liveStatus) {
+                msg = nullptr;                     // say nothing rather than lie
+            } else if (!crowdTestMode && gs.inCooldown) {
                 std::snprintf(obuf, sizeof(obuf), "WAIT %.1f",
-                              static_cast<double>(crowdLink.state().cooldown));
+                              static_cast<double>(gs.cooldown));
                 msg = obuf;
             } else if (full) {
                 msg = "READY";

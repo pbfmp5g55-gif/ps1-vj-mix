@@ -23,17 +23,35 @@ const HTTP_PORT    = num(process.env.CROWD_HTTP_PORT, 8777);
 const MIXER_HOST   = process.env.CROWD_MIXER_HOST || '127.0.0.1';
 const MIXER_PORT   = num(process.env.CROWD_MIXER_PORT, 8778);
 const CONTROL_PORT = num(process.env.CROWD_CONTROL_PORT, 8779);
+// Nominal rates. Windows timer granularity is ~15.6 ms, so setInterval(50)
+// actually lands around 62 ms and the real cadence measures ~16 Hz (confirmed
+// over a 12-minute soak). That is fine: the gauge integrates real elapsed
+// time rather than counting ticks, and the mixer holds the last value for
+// 400 ms before it starts fading, which is six times the observed gap.
 const TICK_HZ      = 20;   // gauge + UDP to the mixer
 const SSE_HZ       = 10;   // state back to phones
 const PUBLIC_DIR   = path.join(__dirname, 'public');
 const VJ_TOKEN     = process.env.CROWD_VJ_TOKEN || crypto.randomBytes(8).toString('hex');
+const BIND_ADDR    = process.env.CROWD_BIND || '0.0.0.0';
+// How long the mixer can go quiet before we treat it as gone. It sends its
+// controls at 10 Hz whenever it is alive.
+const MIXER_TIMEOUT_SEC = 3;
+const CONTROL_RESYNC_SEC = 2;   // accept any seq after this much silence
+const MAX_SSE_CLIENTS = 100;
+const MAX_SSE_PER_ADDR = 3;
 
 function num(v, d) { const n = parseInt(v, 10); return Number.isFinite(n) ? n : d; }
+
+// Monotonic seconds. Date.now() goes backwards when Windows syncs its clock,
+// which would put lastTapAt in the future and leave devices "active" forever.
+const HR0 = process.hrtime.bigint();
+function nowSec() { return Number(process.hrtime.bigint() - HR0) / 1e9; }
 
 const gauge = new Gauge();
 const sseClients = new Set();
 let lastControlSeq = -1;
 let lastControlAt = 0;
+let mixerOnline = false;
 let statsAcceptedTotal = 0;
 let statsClaimedTotal = 0;
 
@@ -91,19 +109,32 @@ const server = http.createServer((req, res) => {
       if (!j || typeof j.id !== 'string' || j.id.length > 64) {
         res.writeHead(400); res.end('{}'); return;
       }
-      const now = Date.now() / 1000;
+      const now = nowSec();
+      const addr = req.socket.remoteAddress || '?';
       const claimed = Number(j.taps) || 0;
       statsClaimedTotal += Math.max(0, claimed);
-      const got = gauge.tap(j.id, claimed, now, req.socket.remoteAddress || '?');
+      const blocked = gauge.deviceBlocked(j.id, addr);
+      const got = blocked ? 0 : gauge.tap(j.id, claimed, now, addr);
       statsAcceptedTotal += got;
       res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
-      res.end(JSON.stringify({ ok: true, accepted: got }));
+      res.end(JSON.stringify({ ok: !blocked, accepted: got,
+                              blocked: blocked ? 'device-limit' : undefined }));
     });
     return;
   }
 
   // --- audience downlink (state stream) ------------------------------------
   if (p === '/events') {
+    // Anyone on the LAN can open these. Cap them, or a single laptop can sit
+    // there opening streams until the process runs out of handles.
+    const addr = req.socket.remoteAddress || '?';
+    let perAddr = 0;
+    for (const c of sseClients) if (c.__addr === addr) perAddr++;
+    if (sseClients.size >= MAX_SSE_CLIENTS || perAddr >= MAX_SSE_PER_ADDR) {
+      res.writeHead(503, { 'Content-Type': 'text/plain' });
+      res.end('too many streams');
+      return;
+    }
     res.writeHead(200, {
       'Content-Type': 'text/event-stream; charset=utf-8',
       'Cache-Control': 'no-store',
@@ -111,8 +142,10 @@ const server = http.createServer((req, res) => {
       'X-Accel-Buffering': 'no',
     });
     res.write(': hello\n\n');
+    res.__addr = addr;
     sseClients.add(res);
     req.on('close', () => sseClients.delete(res));
+    res.on('error', () => sseClients.delete(res));
     return;
   }
 
@@ -136,9 +169,9 @@ const server = http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
       cfg: gauge.cfg,
-      state: gauge.state(Date.now() / 1000),
+      state: gauge.state(nowSec()),
       stats: { claimed: statsClaimedTotal, accepted: statsAcceptedTotal },
-      mixerControlAgeSec: lastControlAt ? (Date.now() / 1000 - lastControlAt) : null,
+      mixerControlAgeSec: lastControlAt ? (nowSec() - lastControlAt) : null,
     }));
     return;
   }
@@ -147,7 +180,8 @@ const server = http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
       ok: true,
-      state: gauge.state(Date.now() / 1000),
+      state: gauge.state(nowSec()),
+      mixerOnline,
       stats: { claimed: statsClaimedTotal, accepted: statsAcceptedTotal },
     }));
     return;
@@ -165,9 +199,14 @@ const udpControl = dgram.createSocket('udp4');
 udpControl.on('message', (buf) => {
   const c = pkt.decodeControl(buf);
   if (!c) return;                                   // junk / wrong version
-  if (lastControlSeq >= 0 && !pkt.seqNewer(c.seq, lastControlSeq)) return;
+  const t = nowSec();
+  // A restarted mixer begins at seq 0 again. Without this, its packets stay
+  // "older" than the ones we already saw and its controls are ignored for up
+  // to an hour. Any gap in the stream means whatever arrives next is current.
+  const resync = lastControlAt === 0 || (t - lastControlAt) > CONTROL_RESYNC_SEC;
+  if (!resync && lastControlSeq >= 0 && !pkt.seqNewer(c.seq, lastControlSeq)) return;
   lastControlSeq = c.seq;
-  lastControlAt = Date.now() / 1000;
+  lastControlAt = t;
   gauge.holdArmed  = c.holdArmed;
   gauge.windowOpen = c.windowOpen;
 });
@@ -177,11 +216,18 @@ udpOut.on('error', (e) => console.error('[crowd] out socket:', e.message));
 // --------------------------------------------------------------------------
 // Ticks
 // --------------------------------------------------------------------------
-let lastTick = Date.now() / 1000;
+let lastTick = nowSec();
 setInterval(() => {
-  const now = Date.now() / 1000;
+  const now = nowSec();
   const dt = now - lastTick;
   lastTick = now;
+  // If the mixer is gone there is nothing on screen to react, so stop taking
+  // taps rather than letting a room hammer their phones at a dead projector.
+  const wasOnline = mixerOnline;
+  mixerOnline = lastControlAt !== 0 && (now - lastControlAt) < MIXER_TIMEOUT_SEC;
+  if (wasOnline && !mixerOnline) console.log('[crowd] mixer went quiet');
+  if (!wasOnline && mixerOnline) console.log('[crowd] mixer connected');
+  if (!mixerOnline) { gauge.windowOpen = false; gauge.holdArmed = false; }
   const r = gauge.tick(dt, now);
   if (r.fired) console.log('[crowd] BURST (active=' + r.rawActive + ')');
   const s = gauge.state(now);
@@ -193,14 +239,15 @@ setInterval(() => {
 
 setInterval(() => {
   if (sseClients.size === 0) return;
-  const s = gauge.state(Date.now() / 1000);
+  const s = gauge.state(nowSec());
+  s.mixerOnline = mixerOnline;
   const line = 'data: ' + JSON.stringify(s) + '\n\n';
   for (const res of sseClients) {
     try { res.write(line); } catch (e) { sseClients.delete(res); }
   }
 }, Math.round(1000 / SSE_HZ));
 
-setInterval(() => gauge.prune(Date.now() / 1000), 60000);
+setInterval(() => gauge.prune(nowSec()), 60000);
 
 // --------------------------------------------------------------------------
 // Start
@@ -215,8 +262,22 @@ function lanAddresses() {
   return out;
 }
 
+function fatal(what, e) {
+  console.error('');
+  console.error('  CROWD server could not start: ' + what);
+  console.error('  ' + (e && e.message ? e.message : e));
+  if (e && e.code === 'EADDRINUSE') {
+    console.error('  Something is already using that port - another copy of');
+    console.error('  this server still running, most likely.');
+  }
+  console.error('');
+  process.exit(1);
+}
+server.on('error', (e) => fatal('the web server could not listen', e));
+udpControl.once('error', (e) => fatal('the control socket could not bind', e));
+
 udpControl.bind(CONTROL_PORT, '127.0.0.1', () => {
-  server.listen(HTTP_PORT, '0.0.0.0', () => {
+  server.listen(HTTP_PORT, BIND_ADDR, () => {
     const addrs = lanAddresses();
     console.log('');
     console.log('  CROWD server up.');
