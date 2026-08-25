@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#000000">
+<title>TAP</title>
+<style>
+  :root { --accent: #ff2d6f; --dim: #333; }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body {
+    margin: 0; height: 100%; overflow: hidden;
+    background: #000; color: #fff;
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    user-select: none; -webkit-user-select: none; touch-action: manipulation;
+  }
+  #wrap { height: 100%; display: flex; flex-direction: column; }
+  #gauge {
+    height: 14vh; min-height: 70px; position: relative;
+    background: #111; border-bottom: 1px solid #222; overflow: hidden;
+  }
+  #fill {
+    position: absolute; inset: 0 auto 0 0; width: 0%;
+    background: linear-gradient(90deg, #4a1030, var(--accent));
+    transition: width 90ms linear;
+  }
+  #flash {
+    position: absolute; inset: 0; background: #fff; opacity: 0;
+    pointer-events: none;
+  }
+  #gtext {
+    position: absolute; inset: 0; display: flex; align-items: center;
+    justify-content: center; font-size: 4.2vh; font-weight: 700;
+    letter-spacing: .12em; text-shadow: 0 0 8px #000;
+  }
+  #pad {
+    flex: 1; display: flex; align-items: center; justify-content: center;
+    font-size: 13vh; font-weight: 900; letter-spacing: .05em;
+    background: radial-gradient(circle at 50% 45%, #1a1a1a, #000 70%);
+  }
+  #pad.hit { background: radial-gradient(circle at 50% 45%, #45142a, #000 70%); }
+  #pad.off { color: #444; font-size: 6vh; letter-spacing: .02em; text-align: center; }
+  #foot {
+    padding: 10px 14px calc(10px + env(safe-area-inset-bottom));
+    font-size: 12px; color: #777; display: flex; justify-content: space-between;
+    background: #0a0a0a; border-top: 1px solid #1a1a1a;
+  }
+  .warn { color: #ffb020; }
+  #held #fill { animation: pulse .45s steps(2, end) infinite; }
+  @keyframes pulse { 0% { opacity: 1 } 50% { opacity: .45 } 100% { opacity: 1 } }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="gauge"><div id="fill"></div><div id="flash"></div><div id="gtext">READY</div></div>
+  <div id="pad">TAP</div>
+  <div id="foot"><span id="mine">0</span><span id="conn" class="warn">接続中…</span></div>
+</div>
+<script>
+(function () {
+  var POST_MS = 250;
+
+  // Stable per-phone id. sessionStorage would reset on every reload and let
+  // one phone farm fresh token buckets; localStorage survives the set.
+  var id = null;
+  try { id = localStorage.getItem('crowd-id'); } catch (e) {}
+  if (!id) {
+    id = (Math.random().toString(36).slice(2) + Date.now().toString(36)).slice(0, 24);
+    try { localStorage.setItem('crowd-id', id); } catch (e) {}
+  }
+
+  var pad = document.getElementById('pad');
+  var fill = document.getElementById('fill');
+  var gtext = document.getElementById('gtext');
+  var flash = document.getElementById('flash');
+  var mine = document.getElementById('mine');
+  var conn = document.getElementById('conn');
+  var gauge = document.getElementById('gauge');
+
+  var pending = 0, mineTotal = 0, windowOpen = true, sending = false;
+  var lastBurst = 0;
+
+  function hit() {
+    if (!windowOpen) return;
+    pending++; mineTotal++;
+    mine.textContent = mineTotal;
+    pad.classList.add('hit');
+    setTimeout(function () { pad.classList.remove('hit'); }, 60);
+    if (navigator.vibrate) { try { navigator.vibrate(8); } catch (e) {} }
+  }
+
+  // touchstart fires before the 300ms click delay, and preventDefault stops
+  // the synthetic click so one finger press is exactly one tap.
+  pad.addEventListener('touchstart', function (e) {
+    e.preventDefault();
+    for (var i = 0; i < e.changedTouches.length; i++) hit();
+  }, { passive: false });
+  pad.addEventListener('mousedown', function (e) { e.preventDefault(); hit(); });
+  document.addEventListener('keydown', function (e) {
+    if (e.code === 'Space' || e.code === 'Enter') { e.preventDefault(); hit(); }
+  });
+  document.addEventListener('gesturestart', function (e) { e.preventDefault(); });
+
+  function send() {
+    if (sending || pending === 0) return;
+    var n = pending; pending = 0; sending = true;
+    fetch('/tap', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: id, taps: n }),
+      keepalive: true,
+    }).then(function (r) { return r.json(); })
+      .then(function () { sending = false; })
+      .catch(function () {
+        // Put them back so a blip does not silently eat the crowd's effort.
+        pending += n; sending = false;
+      });
+  }
+  setInterval(send, POST_MS);
+
+  // Flush what is buffered when the page goes to the background, otherwise a
+  // pocketed phone loses its last quarter second of taps.
+  document.addEventListener('visibilitychange', function () {
+    if (document.visibilityState === 'hidden' && pending > 0) {
+      try {
+        navigator.sendBeacon('/tap', new Blob(
+          [JSON.stringify({ id: id, taps: pending })],
+          { type: 'application/json' }));
+        pending = 0;
+      } catch (e) {}
+    }
+  });
+
+  function apply(s) {
+    fill.style.width = Math.round(s.charge * 100) + '%';
+    windowOpen = s.windowOpen;
+    gauge.id = s.held ? 'held' : '';
+    if (!s.windowOpen) {
+      pad.classList.add('off'); pad.textContent = 'まもなく';
+      gtext.textContent = 'CLOSED';
+    } else {
+      pad.classList.remove('off'); pad.textContent = 'TAP';
+      if (s.held) gtext.textContent = 'READY!!';
+      else if (s.cooldown > 0) gtext.textContent = 'WAIT ' + s.cooldown.toFixed(1);
+      else gtext.textContent = Math.round(s.charge * 100) + '%';
+    }
+    if (s.bursts > lastBurst) {
+      lastBurst = s.bursts;
+      flash.style.transition = 'none'; flash.style.opacity = '0.9';
+      setTimeout(function () {
+        flash.style.transition = 'opacity 600ms ease-out';
+        flash.style.opacity = '0';
+      }, 20);
+    }
+  }
+
+  var es = null, retry = null;
+  function connect() {
+    if (es) { try { es.close(); } catch (e) {} }
+    es = new EventSource('/events');
+    es.onopen = function () { conn.textContent = ''; conn.className = ''; };
+    es.onmessage = function (ev) {
+      try { apply(JSON.parse(ev.data)); } catch (e) {}
+    };
+    es.onerror = function () {
+      conn.textContent = '接続が切れました';
+      conn.className = 'warn';
+      // EventSource retries on its own, but not after some mobile suspends.
+      clearTimeout(retry);
+      retry = setTimeout(connect, 3000);
+    };
+  }
+  connect();
+  document.addEventListener('visibilitychange', function () {
+    if (document.visibilityState === 'visible') connect();
+  });
+})();
+</script>
+</body>
+</html>

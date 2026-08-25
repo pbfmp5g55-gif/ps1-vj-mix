@@ -80,9 +80,16 @@ target_link_libraries(imgui PUBLIC OpenGL::GL)
 add_executable(vj-mix-spike1
     src/mixer/main.cpp
     src/mixer/gl_loader.cpp
+    src/mixer/crowd/crowd_link.cpp
 )
 target_link_libraries(vj-mix-spike1 PRIVATE vj imgui vj_ipc_ring)
 target_include_directories(vj-mix-spike1 PRIVATE src)
+
+# CROWD link: loopback UDP to the crowd server (crowd-server/). Winsock only
+# on Windows; the link compiles to a stub elsewhere.
+if(WIN32)
+    target_link_libraries(vj-mix-spike1 PRIVATE ws2_32)
+endif()
 
 # On MinGW, static-link the C++ / GCC runtime so the resulting exe does not
 # depend on the user's libstdc++-6.dll / libgcc_s-*.dll versions. This avoids

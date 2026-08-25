@@ -13,6 +13,7 @@
 #include "imgui_impl_glfw.h"
 #include "imgui_impl_opengl3.h"
 
+#include "mixer/crowd/crowd_link.h"
 #include "mixer/gl_loader.h"
 #include "mixer/ipc/ipc_ring.h"
 #include "vj/AutoMode.h"
@@ -928,11 +929,14 @@ int main(int argc, char** argv) {
     // IPC already connected.
     const char* cliAttachA = nullptr;
     const char* cliAttachB = nullptr;
+    bool        cliCrowd   = false;   // --crowd: audience control on at boot
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--attach-a") == 0 && i + 1 < argc) {
             cliAttachA = argv[++i];
         } else if (std::strcmp(argv[i], "--attach-b") == 0 && i + 1 < argc) {
             cliAttachB = argv[++i];
+        } else if (std::strcmp(argv[i], "--crowd") == 0) {
+            cliCrowd = true;
         }
     }
 
@@ -1140,6 +1144,31 @@ int main(int argc, char** argv) {
     // base values from the sliders. Pure function in libvj.
     vj::AutoModeParams autoMode;  // enabled=false by default
 
+    // CROWD — the audience taps their phones, the crowd server turns that
+    // into a gauge, and the gauge rides on top of whatever the VJ has set.
+    // See design/CROWD_CONTROL.md. Everything here degrades to "off" when the
+    // server is not running.
+    vjmix::CrowdLink crowdLink;
+    bool  crowdEnabled      = cliCrowd;
+    float crowdCap          = 0.4f;   // how much of the picture the room owns
+    bool  crowdStage2       = false;  // chance / texture / chaos as well
+    bool  crowdAllowMissing = false;  // let a burst drop primitives
+    bool  crowdHoldArmed    = false;  // hold a full gauge until the VJ lets go
+    bool  crowdWindowOpen   = true;   // participation window
+    bool  crowdShowGauge    = true;   // draw the bar on the output
+    // Test injection: drive the gauge from the keyboard with no server and no
+    // phones, which is how the feel gets judged before either exists.
+    bool  crowdTestMode     = false;
+    float crowdTestCharge   = 0.0f;
+    float crowdTestBurst    = 0.0f;
+    bool  prevCrowdBurstKey = false;
+    // What the effects actually use this frame (post-freshness / test mode).
+    float crowdLevel = 0.0f;
+    float crowdHit   = 0.0f;
+    if (!crowdLink.open()) {
+        std::fprintf(stderr, "[crowd] %s\n", crowdLink.state().error);
+    }
+
     // Extend applyMidiOverrides to also drive the filter preset CC when
     // Filter MIDI is on.
     auto applyFilterMidi = [&]() {
@@ -1194,6 +1223,39 @@ int main(int argc, char** argv) {
         const double now = glfwGetTime();
         const double dt  = now - lastTickTime;
         lastTickTime = now;
+
+        // CROWD: read the gauge, tell the server what the VJ is holding.
+        crowdLink.poll(now);
+        crowdLink.sendControl(crowdHoldArmed, crowdWindowOpen, now);
+        if (crowdTestMode) {
+            // T charges (hold it), B fires, R resets. Ignored while a text box
+            // has the keyboard, or typing a filename would set things off.
+            const float fdt = static_cast<float>(dt > 0.25 ? 0.25 : dt);
+            if (!ImGui::GetIO().WantCaptureKeyboard) {
+                if (glfwGetKey(window, GLFW_KEY_T) == GLFW_PRESS) {
+                    crowdTestCharge += fdt * 0.55f;
+                }
+                const bool bNow = glfwGetKey(window, GLFW_KEY_B) == GLFW_PRESS;
+                if (bNow && !prevCrowdBurstKey) {
+                    crowdTestBurst  = 1.0f;
+                    crowdTestCharge = 0.0f;
+                }
+                prevCrowdBurstKey = bNow;
+                if (glfwGetKey(window, GLFW_KEY_R) == GLFW_PRESS) {
+                    crowdTestCharge = crowdTestBurst = 0.0f;
+                }
+            }
+            crowdTestCharge -= fdt * 0.04f;   // the server's default leak
+            if (crowdTestCharge < 0.0f) crowdTestCharge = 0.0f;
+            if (crowdTestCharge > 1.0f) crowdTestCharge = 1.0f;
+            crowdTestBurst -= fdt / 2.5f;     // the server's default decay
+            if (crowdTestBurst < 0.0f) crowdTestBurst = 0.0f;
+            crowdLevel = crowdTestCharge;
+            crowdHit   = crowdTestBurst;
+        } else {
+            crowdLevel = crowdLink.state().level();
+            crowdHit   = crowdLink.state().hit();
+        }
         if (playing && !recording.frames.empty()) {
             frameAccum += dt * 60.0 * static_cast<double>(playSpeed);
             while (frameAccum >= 1.0) {
@@ -1520,6 +1582,66 @@ int main(int argc, char** argv) {
             }
 
             // ---------------------------------------------------------------
+            // CROWD — the audience taps their phones; crowd-server turns that
+            // into a gauge and sends it here. Only the performance controls
+            // live in this panel; the feel (gain / leak / decay) is tuned from
+            // the server's /vj page so it needs no rebuild.
+            // ---------------------------------------------------------------
+            ImGui::Separator();
+            ImGui::Checkbox("CROWD (audience phones)", &crowdEnabled);
+            if (crowdEnabled) {
+                const vjmix::CrowdState& cs = crowdLink.state();
+                if (!cs.socketOpen) {
+                    ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.3f, 1.0f),
+                                       "  link down: %s", cs.error);
+                } else if (crowdTestMode) {
+                    ImGui::TextColored(ImVec4(0.6f, 0.85f, 1.0f, 1.0f),
+                                       "  keyboard test: hold T to charge, B fires, R resets");
+                } else if (!cs.linkAlive()) {
+                    ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.2f, 1.0f),
+                                       "  waiting for crowd-server (UDP %u)",
+                                       static_cast<unsigned>(vjmix::kCrowdListenPort));
+                } else {
+                    ImGui::Text("  %d tapping | pkts %llu | dropped %llu",
+                                cs.active,
+                                static_cast<unsigned long long>(cs.accepted),
+                                static_cast<unsigned long long>(cs.dropped));
+                }
+
+                ImGui::SetNextItemWidth(-90);
+                ImGui::SliderFloat("Crowd strength", &crowdCap, 0.0f, 1.0f, "%.2f");
+                ImGui::SameLine();
+                if (ImGui::Button("CUT")) crowdCap = 0.0f;
+
+                ImGui::Checkbox("HOLD (wait for me)", &crowdHoldArmed);
+                ImGui::SameLine();
+                ImGui::Checkbox("Window open", &crowdWindowOpen);
+                ImGui::SameLine();
+                ImGui::Checkbox("Gauge on output", &crowdShowGauge);
+
+                ImGui::Checkbox("Stage 2 axes (chance / texture / chaos)", &crowdStage2);
+                ImGui::Checkbox("Let the burst drop primitives (MISSING / DEPTH)",
+                                &crowdAllowMissing);
+                ImGui::Checkbox("Keyboard test mode (no server, no phones)",
+                                &crowdTestMode);
+
+                char gbuf[32];
+                std::snprintf(gbuf, sizeof(gbuf), "gauge %.0f%%", crowdLevel * 100.0f);
+                ImGui::ProgressBar(crowdLevel, ImVec2(-1, 0), gbuf);
+                std::snprintf(gbuf, sizeof(gbuf), "burst %.0f%%", crowdHit * 100.0f);
+                ImGui::ProgressBar(crowdHit, ImVec2(-1, 0), gbuf);
+
+                if (!crowdWindowOpen) {
+                    ImGui::TextDisabled("  participation closed");
+                } else if (!crowdTestMode && cs.held) {
+                    ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.2f, 1.0f),
+                                       "  FULL — release HOLD to fire");
+                } else if (!crowdTestMode && cs.inCooldown) {
+                    ImGui::TextDisabled("  cooldown %.1fs", cs.cooldown);
+                }
+            }
+
+            // ---------------------------------------------------------------
             // MIDI section — port selection + Twin Self CC bindings.
             // ---------------------------------------------------------------
             ImGui::Separator();
@@ -1673,9 +1795,14 @@ int main(int argc, char** argv) {
                     const std::vector<vj::Primitive>* drawn = &kept;
                     if (vjEffectsEnabled) {
                         vjPassThruScratch.clear();
-                        const vj::Params effective = autoMode.enabled
+                        vj::Params effective = autoMode.enabled
                             ? vj::applyAutoMode(vjEffectParams, autoMode, vjFrameCounter)
                             : vjEffectParams;
+                        if (crowdEnabled) {
+                            effective = vjmix::applyCrowd(
+                                effective, crowdLevel, crowdHit, crowdCap,
+                                crowdStage2, crowdAllowMissing);
+                        }
                         vjInterceptor.beginFrame(effective, vjFrameCounter);
                         for (auto& p : kept) vjInterceptor.interceptAndSubmit(p);
                         drawn = &vjPassThruScratch;
@@ -1701,11 +1828,86 @@ int main(int argc, char** argv) {
                     renderer.drawUntextured(gh.primitives, vpX, vpY, vpW, vpH, twinAlpha);
                     renderer.drawTextured  (gh.primitives, vpX, vpY, vpW, vpH, twinAlpha);
                 }
-                lastDrawn  = renderer.drawUntextured(fr.primitives, vpX, vpY, vpW, vpH);
-                lastDrawn += renderer.drawTextured  (fr.primitives, vpX, vpY, vpW, vpH);
+                // Glitch (and so CROWD) used to apply to live IPC only, which
+                // made it impossible to judge either from a .vjr recording.
+                // Same pipeline as the live path now.
+                const std::vector<vj::Primitive>* fileDrawn = &fr.primitives;
+                if (vjEffectsEnabled) {
+                    vjPassThruScratch.clear();
+                    vj::Params effective = autoMode.enabled
+                        ? vj::applyAutoMode(vjEffectParams, autoMode, vjFrameCounter)
+                        : vjEffectParams;
+                    if (crowdEnabled) {
+                        effective = vjmix::applyCrowd(
+                            effective, crowdLevel, crowdHit, crowdCap,
+                            crowdStage2, crowdAllowMissing);
+                    }
+                    vjInterceptor.beginFrame(effective, vjFrameCounter);
+                    for (const auto& p : fr.primitives) {
+                        vj::Primitive copy = p;
+                        vjInterceptor.interceptAndSubmit(copy);
+                    }
+                    fileDrawn = &vjPassThruScratch;
+                    ++vjFrameCounter;
+                }
+                lastDrawn  = renderer.drawUntextured(*fileDrawn, vpX, vpY, vpW, vpH);
+                lastDrawn += renderer.drawTextured  (*fileDrawn, vpX, vpY, vpW, vpH);
             }
         } else {
             lastDrawn = 0;
+        }
+
+        // The crowd gauge goes on the foreground draw list, not into the
+        // Controls window: it has to survive F1 (which hides the panel) and
+        // sit over the video, because an audience that cannot see the gauge
+        // has no reason to keep tapping.
+        if (crowdEnabled && crowdShowGauge) {
+            ImDrawList* dl = ImGui::GetForegroundDrawList();
+            const ImVec2 ds = ImGui::GetIO().DisplaySize;
+            const float bh = (ds.y * 0.025f < 10.0f) ? 10.0f : ds.y * 0.025f;
+            const float bw = ds.x * 0.8f;
+            const float bx = (ds.x - bw) * 0.5f;
+            const float by = ds.y - bh - ds.y * 0.05f;
+            const bool  full = crowdTestMode ? (crowdLevel >= 0.999f)
+                                             : crowdLink.state().held;
+            dl->AddRectFilled(ImVec2(bx - 2.0f, by - 2.0f),
+                              ImVec2(bx + bw + 2.0f, by + bh + 2.0f),
+                              IM_COL32(0, 0, 0, 150), 4.0f);
+            dl->AddRectFilled(ImVec2(bx, by), ImVec2(bx + bw, by + bh),
+                              IM_COL32(24, 24, 30, 220), 3.0f);
+            // Full-and-waiting blinks, so the room can see the drop coming.
+            const float pulse =
+                (full && (static_cast<int>(now * 4.0) & 1)) ? 0.45f : 1.0f;
+            const float fw = bw * crowdLevel;
+            if (fw > 1.0f) {
+                dl->AddRectFilled(ImVec2(bx, by), ImVec2(bx + fw, by + bh),
+                                  IM_COL32(static_cast<int>(255 * pulse),
+                                           static_cast<int>(45 * pulse),
+                                           static_cast<int>(111 * pulse), 255),
+                                  3.0f);
+            }
+            if (crowdHit > 0.001f) {
+                dl->AddRectFilled(ImVec2(bx, by), ImVec2(bx + bw, by + bh),
+                                  IM_COL32(255, 255, 255,
+                                           static_cast<int>(220 * crowdHit)), 3.0f);
+            }
+            char obuf[32] = {0};
+            const char* msg = nullptr;
+            if (!crowdWindowOpen) {
+                msg = "CLOSED";
+            } else if (!crowdTestMode && crowdLink.state().inCooldown) {
+                std::snprintf(obuf, sizeof(obuf), "WAIT %.1f",
+                              static_cast<double>(crowdLink.state().cooldown));
+                msg = obuf;
+            } else if (full) {
+                msg = "READY";
+            }
+            if (msg) {
+                const ImVec2 tsz = ImGui::CalcTextSize(msg);
+                dl->AddText(ImVec2(bx + (bw - tsz.x) * 0.5f,
+                                   by + (bh - tsz.y) * 0.5f),
+                            IM_COL32(255, 255, 255, 230), msg);
+            }
         }
 
         ImGui::Render();

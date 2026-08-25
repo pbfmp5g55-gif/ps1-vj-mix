@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CROWD 調整</title>
+<style>
+  body {
+    margin: 0; padding: 18px; background: #101014; color: #ddd;
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif; font-size: 15px;
+  }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  .sub { color: #777; font-size: 13px; margin-bottom: 18px; }
+  .row { margin: 16px 0; }
+  label { display: block; margin-bottom: 6px; }
+  .name { font-weight: 600; }
+  .hint { color: #888; font-size: 12px; }
+  input[type=range] { width: 100%; }
+  .val { float: right; color: #ff2d6f; font-variant-numeric: tabular-nums; }
+  .bar { height: 22px; background: #1c1c22; border-radius: 3px; overflow: hidden; }
+  .bar > div { height: 100%; background: #ff2d6f; width: 0%; transition: width .1s linear; }
+  .bar.b > div { background: #ffcc33; }
+  .stat { display: flex; gap: 18px; color: #999; font-size: 13px; margin-top: 8px;
+          font-variant-numeric: tabular-nums; flex-wrap: wrap; }
+  .warn { color: #ffb020; }
+  hr { border: 0; border-top: 1px solid #23232a; margin: 22px 0; }
+</style>
+</head>
+<body>
+<h1>CROWD 調整</h1>
+<div class="sub">
+  手触りだけをここで決める。効き具合(cap) / HOLD / 参加受付 は<b>ミキサー側</b>。
+</div>
+
+<div class="row">
+  <div class="name">ゲージ <span class="val" id="vCharge">0%</span></div>
+  <div class="bar"><div id="bCharge"></div></div>
+</div>
+<div class="row">
+  <div class="name">一発(burst) <span class="val" id="vBurst">0%</span></div>
+  <div class="bar b"><div id="bBurst"></div></div>
+</div>
+<div class="stat">
+  <span>押している人 <b id="sActive">0</b></span>
+  <span>端末 <b id="sDev">0</b></span>
+  <span>クールダウン <b id="sCd">0.0</b>s</span>
+  <span>発火 <b id="sBursts">0</b>回</span>
+  <span>受理/申告 <b id="sAcc">0/0</b></span>
+  <span id="sMixer" class="warn">ミキサー未接続</span>
+</div>
+
+<hr>
+
+<div class="row">
+  <label><span class="name">溜まりやすさ</span> <span class="val" id="vGain"></span>
+    <div class="hint">1タップで増える量。上げると軽く溜まる</div></label>
+  <input type="range" id="gain" min="0.005" max="0.15" step="0.005">
+</div>
+<div class="row">
+  <label><span class="name">抜けやすさ</span> <span class="val" id="vLeak"></span>
+    <div class="hint">毎秒どれだけ減るか。上げると必死に叩かないと維持できない</div></label>
+  <input type="range" id="leak" min="0" max="1" step="0.01">
+</div>
+<div class="row">
+  <label><span class="name">一発の長さ</span> <span class="val" id="vDecay"></span>
+    <div class="hint">ドカンと来てから収まるまでの秒数</div></label>
+  <input type="range" id="decay" min="0.3" max="8" step="0.1">
+</div>
+<div class="row">
+  <label><span class="name">再発火まで</span> <span class="val" id="vCool"></span>
+    <div class="hint">一発の後、次が出せるようになるまでの秒数</div></label>
+  <input type="range" id="cool" min="0" max="30" step="0.5">
+</div>
+
+<script>
+(function () {
+  var token = new URL(location.href).searchParams.get('t');
+  var api = '/vj/params?t=' + encodeURIComponent(token);
+
+  var ids = { gain: 'baseGain', leak: 'leakRate', decay: 'burstDecaySec', cool: 'cooldownSec' };
+  var labels = { gain: 'vGain', leak: 'vLeak', decay: 'vDecay', cool: 'vCool' };
+  var units = { gain: '', leak: ' /s', decay: ' s', cool: ' s' };
+  var loaded = false;
+
+  function fmt(k, v) { return (+v).toFixed(k === 'gain' ? 3 : 2) + units[k]; }
+
+  Object.keys(ids).forEach(function (k) {
+    var el = document.getElementById(k);
+    el.addEventListener('input', function () {
+      document.getElementById(labels[k]).textContent = fmt(k, el.value);
+    });
+    el.addEventListener('change', function () {
+      var body = {}; body[ids[k]] = parseFloat(el.value);
+      fetch(api, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+    });
+  });
+
+  function poll() {
+    fetch(api).then(function (r) { return r.json(); }).then(function (j) {
+      if (!loaded) {
+        Object.keys(ids).forEach(function (k) {
+          var el = document.getElementById(k);
+          el.value = j.cfg[ids[k]];
+          document.getElementById(labels[k]).textContent = fmt(k, el.value);
+        });
+        loaded = true;
+      }
+      var s = j.state;
+      document.getElementById('bCharge').style.width = (s.charge * 100) + '%';
+      document.getElementById('bBurst').style.width = (s.burst * 100) + '%';
+      document.getElementById('vCharge').textContent = Math.round(s.charge * 100) + '%';
+      document.getElementById('vBurst').textContent = Math.round(s.burst * 100) + '%';
+      document.getElementById('sActive').textContent = s.active;
+      document.getElementById('sDev').textContent = s.devices;
+      document.getElementById('sCd').textContent = s.cooldown.toFixed(1);
+      document.getElementById('sBursts').textContent = s.bursts;
+      document.getElementById('sAcc').textContent = j.stats.accepted + '/' + j.stats.claimed;
+      var m = document.getElementById('sMixer');
+      if (j.mixerControlAgeSec === null || j.mixerControlAgeSec > 3) {
+        m.textContent = 'ミキサー未接続'; m.className = 'warn';
+      } else {
+        m.textContent = 'ミキサー接続中' + (s.holdArmed ? ' / HOLD' : '') +
+                        (s.windowOpen ? '' : ' / 受付CLOSED');
+        m.className = '';
+      }
+    }).catch(function () {});
+  }
+  setInterval(poll, 200);
+  poll();
+})();
+</script>
+</body>
+</html>
