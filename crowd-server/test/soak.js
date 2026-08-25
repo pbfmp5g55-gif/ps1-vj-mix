@@ -33,6 +33,15 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     }
     lastSeq = s;
   });
+  // Without an error handler a port clash (a server left over from an
+  // earlier run) leaves this promise unresolved, the event loop empties and
+  // the whole test exits 0 having checked nothing at all. Ask how this file
+  // knows: it happened.
+  sock.on('error', (e) => {
+    console.error('  cannot listen on UDP ' + MIXER + ': ' + e.code);
+    console.error('  something from an earlier run is probably still alive.');
+    process.exit(1);
+  });
   await new Promise((r) => sock.bind(MIXER, '127.0.0.1', r));
 
   const srv = spawn(process.execPath, [path.join(__dirname, '..', 'server.js')], {
@@ -47,6 +56,17 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   let bursts = 0;
   srv.stdout.on('data', (d) => { if (/BURST/.test(String(d))) bursts++; });
   process.on('exit', () => { try { srv.kill(); } catch (e) {} });
+
+  // Stand in for the mixer. Without its heartbeat the server now closes
+  // participation, and the soak would sit there measuring nothing.
+  const control = dgram.createSocket('udp4');
+  await new Promise((r) => control.bind(0, '127.0.0.1', r));
+  let controlSeq = 0;
+  const hbTimer = setInterval(() => {
+    control.send(pkt.encodeControl({ holdArmed: false, windowOpen: true,
+                                     seq: ++controlSeq }),
+                 CONTROL, '127.0.0.1', () => {});
+  }, 100);
 
   await sleep(1000);
 
@@ -137,8 +157,13 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
               ' pkt/s (nominal 20, ~16 expected on Windows)');
   if (minRate < 12) { console.log('  FAIL cadence too slow'); bad++; }
   if (maxRate - minRate > 4) { console.log('  FAIL cadence unstable'); bad++; }
-  console.log('  device map: ' + last.devices + ' (expected ' + PHONES + ')');
-  if (last.devices > PHONES + 2) { console.log('  FAIL device map grew'); bad++; }
+  // All 20 simulated phones share 127.0.0.1, so only maxDevicesPerAddr of
+  // them can register. In a room each phone has its own address; here the
+  // number to watch is that the map stays bounded and does not creep.
+  const expectDevices = Math.min(PHONES, 12);
+  console.log('  device map: ' + last.devices + ' (cap for one address: ' +
+              expectDevices + ')');
+  if (last.devices > expectDevices) { console.log('  FAIL device map grew'); bad++; }
   console.log('  bursts ' + bursts + ', seq gaps ' + seqGaps +
               ', backwards ' + seqBackwards + ', POST errors ' + postErrors);
   if (seqBackwards > 0) { console.log('  FAIL sequence went backwards'); bad++; }
@@ -146,7 +171,9 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
   console.log('');
   console.log(bad === 0 ? 'soak OK' : 'soak FAILED (' + bad + ')');
+  clearInterval(hbTimer);
   try { srv.kill(); } catch (e) {}
   sock.close();
+  control.close();
   process.exit(bad === 0 ? 0 : 1);
 })();

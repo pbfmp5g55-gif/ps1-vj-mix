@@ -43,6 +43,15 @@ async function get(p) {
   const received = [];
   const sock = dgram.createSocket('udp4');
   sock.on('message', (b) => received.push(b));
+  // Without an error handler a port clash (a server left over from an
+  // earlier run) leaves this promise unresolved, the event loop empties and
+  // the whole test exits 0 having checked nothing at all. Ask how this file
+  // knows: it happened.
+  sock.on('error', (e) => {
+    console.error('  cannot listen on UDP ' + MIXER + ': ' + e.code);
+    console.error('  something from an earlier run is probably still alive.');
+    process.exit(1);
+  });
   await new Promise((r) => sock.bind(MIXER, '127.0.0.1', r));
 
   const control = dgram.createSocket('udp4');
