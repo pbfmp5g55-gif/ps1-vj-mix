@@ -5,9 +5,12 @@ least one **pcsx-redux fork** running a PS1 game and pushing its
 primitive stream over IPC. The pcsx-redux fork lives at:
 
   https://github.com/pbfmp5g55-gif/pcsx-redux — grab the latest
-  `v0.7.x` Windows release ZIP. **Mixer v0.2.x requires fork v0.7.1
-  or newer** for Clean CLUT mode (older v0.7.0 leaves `hostTag=0`
-  and the mixer's palette lookup samples VRAM(0,0)).
+  `v0.7.x` Windows release ZIP. **Mixer v0.10.x wants fork v0.7.10
+  or newer** — that pairing is what the last real session
+  (2026-05-15) was tested on. Older forks degrade in specific ways:
+  v0.7.0 leaves `hostTag=0` so Clean CLUT goes black, and anything
+  before v0.7.10 has a smaller IPC ring that drops frames on
+  sprite-heavy scenes.
 
 Both repos are Windows-only at the moment.
 
@@ -66,6 +69,11 @@ After unzipping `ps1-vj-mix-windows-x64.zip`:
    - Click **Attach** next to channel A.
    - Within a second you should see "ATTACHED, N frames received" growing.
 5. The PS1 game's polygons now render inside the mixer window in real time.
+
+   Shortcut for steps 1-4: launch the emulator with
+   `-vjring Local\vj-mix-prim-A` (auto-starts Live IPC at boot) and the
+   mixer with `--attach-a Local\vj-mix-prim-A` (auto-attaches at
+   startup). A two-line `.bat` then brings the whole rig up.
 6. Optional:
    - Enable **glitch effects** at the bottom and push **MASTER / CHANCE /
      GEOMETRY / TEXTURE / MISSING / COLOR / DEPTH / CHAOS** for live
@@ -125,13 +133,21 @@ in the mixer via the **Open** button in the file section. Useful for:
   - *Direct sample* — legacy "VJ" mode, CLUT prims look broken on purpose.
   - *Discard CLUT* — silhouette only.
   - *Noise CLUT* — replaces CLUT sprites with per-prim hash colours.
-  - *Clean CLUT (proper palette lookup)* — actually decodes the
-    palette and shows the game's real graphics. **Requires
+  - *Clean CLUT (VRAM palette lookup)* — decodes the palette out of
+    VRAM and shows the game's real graphics. **Requires
     pcsx-redux fork v0.7.1+** (the fork has to send TPage + CLUT in
     `hostTag`); with v0.7.0 you'll get a black screen in Clean mode.
+  - *Shape only (vertex color)* — silhouette filled with the
+    primitive's own vertex colour.
+  - *Clean CLUT (inline palette)* — the fork ships the palette inline
+    with each primitive (stream format v3), so this survives VRAM
+    relocation. **Requires fork v0.7.6+.** This is the one to use in
+    Phase C.
 - **Clean mode flickers.** Live IPC ring drops under heavy traffic.
-  Make sure you're on **pcsx-redux fork v0.7.2+** (default ring
-  bumped from 2 MB to 8 MB).
+  Make sure you're on **pcsx-redux fork v0.7.10** (the ring grew
+  2 MB -> 8 MB -> 32 MB across v0.7.2 .. v0.7.10; sprite-heavy
+  frames need the 32 MB one). The per-channel `dropped=` counter in
+  the mixer Controls window tells you if this is what's happening.
 
 ## Selftest
 
