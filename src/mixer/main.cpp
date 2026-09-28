@@ -995,7 +995,7 @@ int main(int argc, char** argv) {
 
     // MIDI controller (libvj's RtMidi-backed). When a port is open and
     // m_midiOverride is on, every frame we poll CC values and overwrite the
-    // Twin Self params (and any future MIDI-bound mixer params) from MIDI.
+    // Twin Self and Phase B/C mixer params from MIDI.
     std::unique_ptr<vj::RtMidiController> midi;
     int  midiPortIndex = -1;          // currently-open port, -1 = none
     bool midiOverrideEnabled = true;  // master switch
@@ -1088,8 +1088,8 @@ int main(int argc, char** argv) {
         if (!midi || !midiOverrideEnabled) return;
         const int c = midi->getCC(clutModeCC);
         if (c >= 0) {
-            // 5 CLUT modes: 0..127 -> 0..4 in 5 even bands (~26 CC values
-            // each). Mode 0=Direct 1=Discard 2=Noise 3=Clean 4=ShapeOnly.
+            // 6 CLUT modes: 0..127 -> 0..5 in 6 bands (~21 CC values each).
+            // 0=Direct 1=Discard 2=Noise 3=Clean(VRAM) 4=Shape 5=Clean(inline).
             int m = (c * 6) / 128;
             if (m > 5) m = 5;
             renderer.clutMode = m;
