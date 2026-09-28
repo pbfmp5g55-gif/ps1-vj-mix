@@ -36,7 +36,7 @@ UI が個別にバラける。2台のエミュを走らせて混ぜられる。
 - グリッチ8種(MASTER/CHANCE/GEOMETRY/TEXTURE/MISSING/COLOR/DEPTH/CHAOS)
 - AutoMode(LFOで勝手に揺らす)、フィルタプリセットバンク(範囲・面積・テクスチャ有無で
   対象を絞る。ファイル保存あり)
-- `.vjr` 録画の再生、Twin Self(過去フレームの残像) ※**Twin Self はファイル再生時のみ**
+- `.vjr` 録画の再生、Twin Self(過去フレームの残像。ファイル再生・ライブ入力の履歴に対応)
 - MIDI入力(RtMidi)、CC の Learn
 - `-vjring` / `--attach-a` で自動接続 → bat 一発で起動できる
 
