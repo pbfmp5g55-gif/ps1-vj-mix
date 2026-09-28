@@ -994,7 +994,7 @@ int main(int argc, char** argv) {
     float  twinAlpha = 0.5f;      // colour-mul factor for the ghost
 
     // MIDI controller (libvj's RtMidi-backed). When a port is open and
-    // m_midiOverride is on, every frame we poll CC values and overwrite the
+    // midiOverrideEnabled is on, every frame we poll CC values and overwrite
     // Twin Self and Phase B/C mixer params from MIDI.
     std::unique_ptr<vj::RtMidiController> midi;
     int  midiPortIndex = -1;          // currently-open port, -1 = none
