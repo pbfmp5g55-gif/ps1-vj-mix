@@ -2,6 +2,7 @@
 // loaded .vjr file (M2) + a tiny GL renderer for untextured polygons
 // (M3). M4 will add textured polys; subsequent milestones blend modes etc.
 
+#include <cfloat>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -16,6 +17,7 @@
 #include "mixer/crowd/crowd_link.h"
 #include "mixer/gl_loader.h"
 #include "mixer/ipc/ipc_ring.h"
+#include "mixer/output/output_monitor.h"
 #include "vj/AutoMode.h"
 #include "vj/FilterPresetBank.h"
 #include "vj/Params.h"
@@ -29,6 +31,34 @@ namespace {
 
 void glfwErrorCallback(int code, const char* msg) {
     std::fprintf(stderr, "[GLFW] %d: %s\n", code, msg);
+}
+
+// Set by the monitor callback, handled once per frame in the main loop. The
+// GLFWmonitor* handed to the callback is dead once it returns, so nothing
+// else is done there.
+bool g_monitorsChanged = false;
+
+// The ImGui GLFW backend installs its own monitor callback (it keeps the
+// viewport monitor list) and does not chain to one installed later. Ours
+// replaces it, so it must forward first or ImGui stops seeing hot-plugs.
+void monitorCallback(GLFWmonitor* monitor, int event) {
+    ImGui_ImplGlfw_MonitorCallback(monitor, event);
+    g_monitorsChanged = true;
+}
+
+// imgui.ini next to the exe, not in whatever the current directory happens
+// to be (shortcut, PowerShell, launcher .bat all differ).
+std::string exeDirectory() {
+#ifdef _WIN32
+    char buf[MAX_PATH] = {0};
+    const DWORD n = GetModuleFileNameA(nullptr, buf, MAX_PATH);
+    if (n > 0 && n < MAX_PATH) {
+        std::string path(buf, n);
+        const size_t slash = path.find_last_of("\\/");
+        if (slash != std::string::npos) return path.substr(0, slash + 1);
+    }
+#endif
+    return std::string();
 }
 
 // PS1 native resolution we render at. The window upscales from this.
@@ -930,6 +960,8 @@ int main(int argc, char** argv) {
     const char* cliAttachA = nullptr;
     const char* cliAttachB = nullptr;
     bool        cliCrowd   = false;   // --crowd: audience control on at boot
+    bool        cliWindowed = false;  // --windowed: no automatic fullscreen
+    int         cliOutputMonitor = -1;  // --output-monitor N (1-based)
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--attach-a") == 0 && i + 1 < argc) {
             cliAttachA = argv[++i];
@@ -937,6 +969,10 @@ int main(int argc, char** argv) {
             cliAttachB = argv[++i];
         } else if (std::strcmp(argv[i], "--crowd") == 0) {
             cliCrowd = true;
+        } else if (std::strcmp(argv[i], "--windowed") == 0) {
+            cliWindowed = true;
+        } else if (std::strcmp(argv[i], "--output-monitor") == 0 && i + 1 < argc) {
+            cliOutputMonitor = std::atoi(argv[++i]) - 1;  // shown 1-based
         }
     }
 
@@ -954,7 +990,7 @@ int main(int argc, char** argv) {
 #endif
 
     GLFWwindow* window =
-        glfwCreateWindow(1024, 720, "ps1-vj-mix — Spike 1", nullptr, nullptr);
+        glfwCreateWindow(1024, 720, "ps1-vj-mix — Output", nullptr, nullptr);
     if (!window) {
         std::fprintf(stderr, "glfwCreateWindow failed\n");
         glfwTerminate();
@@ -974,8 +1010,26 @@ int main(int argc, char** argv) {
     ImGui::CreateContext();
     ImGui::StyleColorsDark();
 
+    // The GLFW window is the projector output; the Controls panel lives in
+    // its own OS window (ImGui multi-viewport) on the laptop screen. See
+    // design/OUTPUT_WINDOW.md.
+    ImGuiIO& io = ImGui::GetIO();
+    io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;
+    // Applies to every floating ImGui window, tooltips and popups included:
+    // none of them may ever fold back onto the output picture.
+    io.ConfigViewportsNoAutoMerge = true;
+    static const std::string iniPath = exeDirectory() + "imgui.ini";
+    io.IniFilename = iniPath.c_str();
+    {
+        // Platform windows look wrong with rounded / translucent backgrounds.
+        ImGuiStyle& style = ImGui::GetStyle();
+        style.WindowRounding = 0.0f;
+        style.Colors[ImGuiCol_WindowBg].w = 1.0f;
+    }
+
     ImGui_ImplGlfw_InitForOpenGL(window, true);
     ImGui_ImplOpenGL3_Init("#version 330");
+    glfwSetMonitorCallback(monitorCallback);  // after the backend installs its own
 
     Renderer renderer;
     if (!renderer.init()) {
@@ -1104,15 +1158,106 @@ int main(int argc, char** argv) {
         if (r >= 0) relocateBX = static_cast<float>(r) / 127.0f * 512.0f;
     };
 
-    // VJ output preferences: hide the GUI + window chrome so the mixer
-    // window is a pure VJ surface. Hotkeys:
-    //   F1   toggle Controls panel + all ImGui windows
-    //   F11  toggle borderless fullscreen on the current monitor
-    bool showUI       = true;
-    bool borderless   = false;
-    bool prevF1Down   = false;
-    bool prevF11Down  = false;
+    // Output window + Controls window. Hotkeys work from either window
+    // (read through ImGui, which gets keys from every viewport):
+    //   F1   hide / show the Controls window
+    //   F2   pull the Controls window back onto the primary monitor
+    //   F11  output: borderless fullscreen on the selected monitor <-> window
+    //   F12  BLACK (output goes black, gauge included)
+    bool showUI          = true;
+    bool recallControls  = false;
+    bool blackout        = false;
+    std::vector<vjmix::MonitorInfo> monInfos;
+    bool  outputFullscreen = false;
+    int   outputMonitor    = -1;   // index into monInfos while fullscreen
+    vjmix::MonitorInfo outputMonitorInfo;
+    int   monitorSel       = 0;    // the Controls combo
+    double identifyUntil   = 0.0;  // show "OUTPUT n" on the output until then
     int  saveWinX = 0, saveWinY = 0, saveWinW = 0, saveWinH = 0;
+    bool saveWinMaximized = false;
+    // Frame time, so "it feels heavy" at a venue becomes a number.
+    double frameMsMax = 0.0, frameMsMaxShown = 0.0, frameMsWindowStart = 0.0;
+
+    auto enumerateMonitors = [&]() {
+        monInfos.clear();
+        int n = 0;
+        GLFWmonitor** ms = glfwGetMonitors(&n);
+        GLFWmonitor* prim = glfwGetPrimaryMonitor();
+        for (int i = 0; i < n; ++i) {
+            vjmix::MonitorInfo m;
+            const char* name = glfwGetMonitorName(ms[i]);
+            m.name = name ? name : "?";
+            glfwGetMonitorPos(ms[i], &m.x, &m.y);
+            if (const GLFWvidmode* vm = glfwGetVideoMode(ms[i])) {
+                m.w = vm->width;
+                m.h = vm->height;
+            }
+            m.primary = (ms[i] == prim);
+            float sx = 1.0f, sy = 1.0f;
+            glfwGetMonitorContentScale(ms[i], &sx, &sy);
+            std::fprintf(stderr, "[output] monitor %d: %s %dx%d at (%d,%d) scale %.2f%s\n",
+                         i + 1, m.name.c_str(), m.w, m.h, m.x, m.y,
+                         static_cast<double>(sx), m.primary ? " primary" : "");
+            monInfos.push_back(m);
+        }
+        if (monitorSel >= static_cast<int>(monInfos.size())) monitorSel = 0;
+    };
+    auto enterFullscreen = [&](int idx) {
+        if (idx < 0 || idx >= static_cast<int>(monInfos.size())) return;
+        if (!outputFullscreen) {
+            saveWinMaximized = glfwGetWindowAttrib(window, GLFW_MAXIMIZED) != 0;
+            if (saveWinMaximized) glfwRestoreWindow(window);
+            glfwGetWindowPos(window, &saveWinX, &saveWinY);
+            glfwGetWindowSize(window, &saveWinW, &saveWinH);
+        }
+        const vjmix::MonitorInfo& m = monInfos[static_cast<size_t>(idx)];
+        // Borderless window covering the monitor, not exclusive fullscreen:
+        // exclusive mode iconifies the output as soon as the VJ clicks the
+        // Controls window on the other screen.
+        glfwSetWindowAttrib(window, GLFW_DECORATED, GLFW_FALSE);
+        glfwSetWindowMonitor(window, nullptr, m.x, m.y, m.w, m.h, GLFW_DONT_CARE);
+        outputFullscreen  = true;
+        outputMonitor     = idx;
+        outputMonitorInfo = m;
+        monitorSel        = idx;
+        identifyUntil     = glfwGetTime() + 3.0;
+        std::fprintf(stderr, "[output] fullscreen on monitor %d (%s)\n",
+                     idx + 1, m.name.c_str());
+    };
+    // toPrimary: the monitor the output was on is gone, and the saved
+    // windowed rect may have been on it too.
+    auto leaveFullscreen = [&](bool toPrimary) {
+        if (!outputFullscreen) return;
+        outputFullscreen = false;
+        outputMonitor    = -1;
+        glfwSetWindowAttrib(window, GLFW_DECORATED, GLFW_TRUE);
+        int x = saveWinX, y = saveWinY;
+        if (toPrimary) {
+            int wx = 0, wy = 0, ww = 0, wh = 0;
+            if (GLFWmonitor* prim = glfwGetPrimaryMonitor()) {
+                glfwGetMonitorWorkarea(prim, &wx, &wy, &ww, &wh);
+            }
+            x = wx + 80;
+            y = wy + 80;
+        }
+        glfwSetWindowMonitor(window, nullptr, x, y,
+                             saveWinW > 0 ? saveWinW : 1024,
+                             saveWinH > 0 ? saveWinH : 720, GLFW_DONT_CARE);
+        if (saveWinMaximized && !toPrimary) glfwMaximizeWindow(window);
+        std::fprintf(stderr, "[output] windowed%s\n", toPrimary ? " (monitor lost)" : "");
+    };
+
+    enumerateMonitors();
+    {
+        const int idx = vjmix::chooseOutputMonitor(monInfos, cliOutputMonitor);
+        if (idx >= 0) monitorSel = idx;
+        if (!cliWindowed && idx >= 0) {
+            enterFullscreen(idx);
+        } else {
+            std::fprintf(stderr, "[output] staying windowed (%s)\n",
+                         cliWindowed ? "--windowed" : "no second monitor");
+        }
+    }
 
     // libvj effects on the mixed stream. The interceptor lives across frames
     // (its internal RandomController + DepthDelayQueue need persistence);
@@ -1161,7 +1306,6 @@ int main(int argc, char** argv) {
     bool  crowdTestMode     = false;
     float crowdTestCharge   = 0.0f;
     float crowdTestBurst    = 0.0f;
-    bool  prevCrowdBurstKey = false;
     // What the effects actually use this frame (post-freshness / test mode).
     float crowdLevel = 0.0f;
     float crowdHit   = 0.0f;
@@ -1183,34 +1327,19 @@ int main(int argc, char** argv) {
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
 
-        // VJ hotkeys: F1 hides the GUI overlay, F11 toggles a borderless
-        // fullscreen window. Both edge-triggered (act on press, not hold).
-        {
-            const bool f1Now  = glfwGetKey(window, GLFW_KEY_F1)  == GLFW_PRESS;
-            const bool f11Now = glfwGetKey(window, GLFW_KEY_F11) == GLFW_PRESS;
-            if (f1Now && !prevF1Down) showUI = !showUI;
-            if (f11Now && !prevF11Down) {
-                borderless = !borderless;
-                if (borderless) {
-                    glfwGetWindowPos(window, &saveWinX, &saveWinY);
-                    glfwGetWindowSize(window, &saveWinW, &saveWinH);
-                    GLFWmonitor* mon = glfwGetPrimaryMonitor();
-                    const GLFWvidmode* vm = mon ? glfwGetVideoMode(mon) : nullptr;
-                    glfwSetWindowAttrib(window, GLFW_DECORATED, GLFW_FALSE);
-                    if (vm) {
-                        glfwSetWindowPos(window, 0, 0);
-                        glfwSetWindowSize(window, vm->width, vm->height);
-                    }
+        // A projector came or went: re-list, and if the output was on the
+        // one that left, drop back to a window on the primary screen.
+        if (g_monitorsChanged) {
+            g_monitorsChanged = false;
+            enumerateMonitors();
+            if (outputFullscreen) {
+                const int idx = vjmix::findSameMonitor(monInfos, outputMonitorInfo);
+                if (idx < 0) {
+                    leaveFullscreen(true);
                 } else {
-                    glfwSetWindowAttrib(window, GLFW_DECORATED, GLFW_TRUE);
-                    glfwSetWindowPos(window, saveWinX, saveWinY);
-                    glfwSetWindowSize(window,
-                                      saveWinW > 0 ? saveWinW : 1024,
-                                      saveWinH > 0 ? saveWinH : 720);
+                    enterFullscreen(idx);  // re-fit: its mode may have changed
                 }
             }
-            prevF1Down  = f1Now;
-            prevF11Down = f11Now;
         }
 
         // Pull any pending MIDI CC values into Twin Self params before any
@@ -1224,38 +1353,6 @@ int main(int argc, char** argv) {
         const double dt  = now - lastTickTime;
         lastTickTime = now;
 
-        // CROWD: read the gauge, tell the server what the VJ is holding.
-        crowdLink.poll(now);
-        crowdLink.sendControl(crowdHoldArmed, crowdWindowOpen, now);
-        if (crowdTestMode) {
-            // T charges (hold it), B fires, R resets. Ignored while a text box
-            // has the keyboard, or typing a filename would set things off.
-            const float fdt = static_cast<float>(dt > 0.25 ? 0.25 : dt);
-            if (!ImGui::GetIO().WantCaptureKeyboard) {
-                if (glfwGetKey(window, GLFW_KEY_T) == GLFW_PRESS) {
-                    crowdTestCharge += fdt * 0.55f;
-                }
-                const bool bNow = glfwGetKey(window, GLFW_KEY_B) == GLFW_PRESS;
-                if (bNow && !prevCrowdBurstKey) {
-                    crowdTestBurst  = 1.0f;
-                    crowdTestCharge = 0.0f;
-                }
-                prevCrowdBurstKey = bNow;
-                if (glfwGetKey(window, GLFW_KEY_R) == GLFW_PRESS) {
-                    crowdTestCharge = crowdTestBurst = 0.0f;
-                }
-            }
-            crowdTestCharge -= fdt * 0.04f;   // the server's default leak
-            if (crowdTestCharge < 0.0f) crowdTestCharge = 0.0f;
-            if (crowdTestCharge > 1.0f) crowdTestCharge = 1.0f;
-            crowdTestBurst -= fdt / 2.5f;     // the server's default decay
-            if (crowdTestBurst < 0.0f) crowdTestBurst = 0.0f;
-            crowdLevel = crowdTestCharge;
-            crowdHit   = crowdTestBurst;
-        } else {
-            crowdLevel = crowdLink.state().level();
-            crowdHit   = crowdLink.state().hit();
-        }
         if (playing && !recording.frames.empty()) {
             frameAccum += dt * 60.0 * static_cast<double>(playSpeed);
             while (frameAccum >= 1.0) {
@@ -1310,8 +1407,118 @@ int main(int argc, char** argv) {
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
 
+        // Hotkeys, edge-triggered. Function keys act even while a text box
+        // has the keyboard; letter keys (CROWD test) do not.
+        if (ImGui::IsKeyPressed(ImGuiKey_F1, false)) showUI = !showUI;
+        if (ImGui::IsKeyPressed(ImGuiKey_F2, false)) {
+            showUI = true;
+            recallControls = true;
+        }
+        if (ImGui::IsKeyPressed(ImGuiKey_F11, false)) {
+            if (outputFullscreen) leaveFullscreen(false);
+            else                  enterFullscreen(monitorSel);
+        }
+        if (ImGui::IsKeyPressed(ImGuiKey_F12, false)) blackout = !blackout;
+
+        {
+            const double ms = dt * 1000.0;
+            if (ms > frameMsMax) frameMsMax = ms;
+            if (now - frameMsWindowStart >= 2.0) {
+                frameMsMaxShown    = frameMsMax;
+                frameMsMax         = 0.0;
+                frameMsWindowStart = now;
+            }
+        }
+
+        // CROWD: read the gauge, tell the server what the VJ is holding.
+        crowdLink.poll(now);
+        crowdLink.sendControl(crowdHoldArmed, crowdWindowOpen, now);
+        if (crowdTestMode) {
+            // T charges (hold it), B fires, R resets. Ignored while a text box
+            // has the keyboard, or typing a filename would set things off.
+            // Read through ImGui so they work with either window in front.
+            const float fdt = static_cast<float>(dt > 0.25 ? 0.25 : dt);
+            if (!io.WantCaptureKeyboard) {
+                if (ImGui::IsKeyDown(ImGuiKey_T)) {
+                    crowdTestCharge += fdt * 0.55f;
+                }
+                if (ImGui::IsKeyPressed(ImGuiKey_B, false)) {
+                    crowdTestBurst  = 1.0f;
+                    crowdTestCharge = 0.0f;
+                }
+                if (ImGui::IsKeyDown(ImGuiKey_R)) {
+                    crowdTestCharge = crowdTestBurst = 0.0f;
+                }
+            }
+            crowdTestCharge -= fdt * 0.04f;   // the server's default leak
+            if (crowdTestCharge < 0.0f) crowdTestCharge = 0.0f;
+            if (crowdTestCharge > 1.0f) crowdTestCharge = 1.0f;
+            crowdTestBurst -= fdt / 2.5f;     // the server's default decay
+            if (crowdTestBurst < 0.0f) crowdTestBurst = 0.0f;
+            crowdLevel = crowdTestCharge;
+            crowdHit   = crowdTestBurst;
+        } else {
+            crowdLevel = crowdLink.state().level();
+            crowdHit   = crowdLink.state().hit();
+        }
+
         if (showUI) {
-        if (ImGui::Begin("Controls")) {
+        {
+            // First run (no imgui.ini) or F2: top-left of the primary
+            // screen's work area, sized to fit a 768-px-high laptop.
+            int wx = 0, wy = 0, ww = 1280, wh = 720;
+            if (GLFWmonitor* prim = glfwGetPrimaryMonitor()) {
+                glfwGetMonitorWorkarea(prim, &wx, &wy, &ww, &wh);
+            }
+            const float cw = (ww - 80 < 560) ? static_cast<float>(ww - 80) : 560.0f;
+            const float ch = (wh - 80 < 820) ? static_cast<float>(wh - 80) : 820.0f;
+            const ImGuiCond cond = recallControls ? ImGuiCond_Always
+                                                  : ImGuiCond_FirstUseEver;
+            ImGui::SetNextWindowPos(ImVec2(static_cast<float>(wx + 40),
+                                           static_cast<float>(wy + 40)), cond);
+            ImGui::SetNextWindowSize(ImVec2(cw, ch), cond);
+            recallControls = false;
+        }
+        if (ImGui::Begin("Controls", &showUI)) {
+            if (ImGui::CollapsingHeader("Output", ImGuiTreeNodeFlags_DefaultOpen)) {
+                auto monLabel = [&](int i) {
+                    const vjmix::MonitorInfo& m = monInfos[static_cast<size_t>(i)];
+                    char b[160];
+                    std::snprintf(b, sizeof(b), "%d: %s  %dx%d%s", i + 1,
+                                  m.name.c_str(), m.w, m.h,
+                                  m.primary ? "  (primary)" : "");
+                    return std::string(b);
+                };
+                const std::string cur = monInfos.empty() ? std::string("(none)")
+                                                         : monLabel(monitorSel);
+                ImGui::SetNextItemWidth(-1);
+                if (ImGui::BeginCombo("##outmon", cur.c_str())) {
+                    for (int i = 0; i < static_cast<int>(monInfos.size()); ++i) {
+                        if (ImGui::Selectable(monLabel(i).c_str(), i == monitorSel)) {
+                            monitorSel = i;
+                            // Already fullscreen: move the picture now.
+                            if (outputFullscreen && i != outputMonitor) enterFullscreen(i);
+                        }
+                    }
+                    ImGui::EndCombo();
+                }
+                if (outputFullscreen) {
+                    ImGui::Text("Fullscreen on monitor %d", outputMonitor + 1);
+                    ImGui::SameLine();
+                    if (ImGui::Button("Window (F11)")) leaveFullscreen(false);
+                } else {
+                    ImGui::TextUnformatted("Windowed");
+                    ImGui::SameLine();
+                    if (ImGui::Button("Fullscreen on selected (F11)")) enterFullscreen(monitorSel);
+                }
+                if (ImGui::Button("Identify")) identifyUntil = now + 3.0;
+                ImGui::SameLine();
+                ImGui::Checkbox("BLACK (F12)", &blackout);
+                ImGui::Text("frame %.1f ms   worst in 2 s: %.1f ms",
+                            dt * 1000.0, frameMsMaxShown);
+                ImGui::TextDisabled("F1 hide controls  F2 recall controls");
+                ImGui::Separator();
+            }
             ImGui::TextUnformatted("Live IPC sources (Phase B):");
             auto channelRow = [&](LiveChannel& ch, const char* label) {
                 ImGui::PushID(label);
@@ -1743,14 +1950,15 @@ int main(int argc, char** argv) {
         int displayH = 0;
         glfwGetFramebufferSize(window, &displayW, &displayH);
         glViewport(0, 0, displayW, displayH);
-        glClearColor(0.02f, 0.02f, 0.04f, 1.0f);
+        if (blackout) glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+        else          glClearColor(0.02f, 0.02f, 0.04f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
 
         const bool liveActive =
             (chA.reader.isOpen() && chA.hasFrame) ||
             (chB.reader.isOpen() && chB.hasFrame);
         const bool haveSource = liveActive || !recording.frames.empty();
-        if (haveSource && renderer.program) {
+        if (haveSource && renderer.program && !blackout) {
             const float aspectPSX = static_cast<float>(kPS1Width) /
                                     static_cast<float>(kPS1Height);
             int vpW = displayW;
@@ -1872,13 +2080,17 @@ int main(int argc, char** argv) {
         // Controls window: it has to survive F1 (which hides the panel) and
         // sit over the video, because an audience that cannot see the gauge
         // has no reason to keep tapping.
-        if (crowdEnabled && crowdShowGauge) {
-            ImDrawList* dl = ImGui::GetForegroundDrawList();
-            const ImVec2 ds = ImGui::GetIO().DisplaySize;
+        // With viewports on, ImGui coordinates are virtual-desktop absolute:
+        // the output window's own rect is the main viewport's Pos / Size.
+        ImGuiViewport* outVp = ImGui::GetMainViewport();
+        if (crowdEnabled && crowdShowGauge && !blackout) {
+            ImDrawList* dl = ImGui::GetForegroundDrawList(outVp);
+            const ImVec2 ds = outVp->Size;
+            const ImVec2 o  = outVp->Pos;
             const float bh = (ds.y * 0.025f < 10.0f) ? 10.0f : ds.y * 0.025f;
             const float bw = ds.x * 0.8f;
-            const float bx = (ds.x - bw) * 0.5f;
-            const float by = ds.y - bh - ds.y * 0.05f;
+            const float bx = o.x + (ds.x - bw) * 0.5f;
+            const float by = o.y + ds.y - bh - ds.y * 0.05f;
             // held / inCooldown are latched from the last packet and do not
             // fade out with freshness, so a dead server would otherwise leave
             // the projection blinking READY at the room for the rest of the set.
@@ -1928,9 +2140,45 @@ int main(int argc, char** argv) {
             }
         }
 
+        // Identify: a big number on the output, so the VJ can tell which
+        // screen the room is looking at (venues reorder / swap primaries).
+        if (now < identifyUntil) {
+            ImDrawList* dl = ImGui::GetForegroundDrawList(outVp);
+            char ibuf[64];
+            if (outputFullscreen) {
+                std::snprintf(ibuf, sizeof(ibuf), "OUTPUT %d", outputMonitor + 1);
+            } else {
+                std::snprintf(ibuf, sizeof(ibuf), "OUTPUT (window)");
+            }
+            const float fs = outVp->Size.y * 0.15f;
+            const ImVec2 tsz = ImGui::GetFont()->CalcTextSizeA(fs, FLT_MAX, 0.0f, ibuf);
+            const ImVec2 p(outVp->Pos.x + (outVp->Size.x - tsz.x) * 0.5f,
+                           outVp->Pos.y + (outVp->Size.y - tsz.y) * 0.5f);
+            dl->AddRectFilled(ImVec2(p.x - fs * 0.2f, p.y - fs * 0.1f),
+                              ImVec2(p.x + tsz.x + fs * 0.2f, p.y + tsz.y + fs * 0.1f),
+                              IM_COL32(0, 0, 0, 200));
+            dl->AddText(ImGui::GetFont(), fs, p, IM_COL32(255, 255, 255, 255), ibuf);
+        }
+
+        // No pointer over the projected picture. ImGui's cursor request is
+        // applied to every OS window, but the pointer can only be over one of
+        // them, so asking for "none" while it is over the output is enough.
+        if (outputFullscreen && glfwGetWindowAttrib(window, GLFW_HOVERED)) {
+            ImGui::SetMouseCursor(ImGuiMouseCursor_None);
+        }
+
         ImGui::Render();
         glViewport(0, 0, displayW, displayH);
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+
+        // Controls (and any popup) are separate OS windows: render them,
+        // then put the output window's context back before swapping it.
+        if (io.ConfigFlags & ImGuiConfigFlags_ViewportsEnable) {
+            GLFWwindow* backup = glfwGetCurrentContext();
+            ImGui::UpdatePlatformWindows();
+            ImGui::RenderPlatformWindowsDefault();
+            glfwMakeContextCurrent(backup);
+        }
 
         glfwSwapBuffers(window);
     }

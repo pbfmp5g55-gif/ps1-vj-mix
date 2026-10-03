@@ -49,7 +49,7 @@ FetchContent_MakeAvailable(glfw)
 FetchContent_Declare(
     imgui
     GIT_REPOSITORY https://github.com/ocornut/imgui.git
-    GIT_TAG        v1.91.0
+    GIT_TAG        v1.91.0-docking   # multi-viewport: Controls in its own OS window
 )
 FetchContent_MakeAvailable(imgui)
 
@@ -81,6 +81,7 @@ add_executable(vj-mix-spike1
     src/mixer/main.cpp
     src/mixer/gl_loader.cpp
     src/mixer/crowd/crowd_link.cpp
+    src/mixer/output/output_monitor.cpp
 )
 target_link_libraries(vj-mix-spike1 PRIVATE vj imgui vj_ipc_ring)
 target_include_directories(vj-mix-spike1 PRIVATE src)
@@ -112,3 +113,10 @@ add_executable(vj-mix-ipc-selftest
     src/mixer/ipc/selftest.cpp
 )
 target_link_libraries(vj-mix-ipc-selftest PRIVATE vj_ipc_ring)
+
+# Output-monitor selection rules (pure logic, made-up monitor lists).
+add_executable(vj-mix-output-selftest
+    src/mixer/output/output_selftest.cpp
+    src/mixer/output/output_monitor.cpp
+)
+target_include_directories(vj-mix-output-selftest PRIVATE src)
