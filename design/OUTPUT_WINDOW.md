@@ -68,3 +68,22 @@
      (Keyboard test mode で T 長押し → ゲージ)
    - (a)(c) の 2 枚構成は本人の PC + プロジェクターでしか確認できない → チェックリストを渡す
 4. 検証できない部分: 2 枚目のモニター上の見え方・抜き差し。報告に未検証として明記
+
+## GPT レビューで変えた点(2026-10-03)
+
+設計レビュー:
+- カーソルは backend 後に出力窓だけ上書き案 → 採らず、`SetMouseCursor(None)` を「出力窓が HOVERED の時だけ」。
+  既知の妥協: ループが止まった瞬間にポインタが Controls へ移ると、次フレームまで Controls 上でも消える。Controls に切替チェックあり
+- ImGui backend は自前の monitor callback を張り、後から張ったものをチェインしない → アプリの callback から
+  `ImGui_ImplGlfw_MonitorCallback` を先に呼ぶ
+- Controls は `Begin("Controls", &showUI)`、サイズは work area に収める、F2 は `ImGuiCond_Always`、imgui.ini は exe 横に固定
+- 本番用: BLACK(F12)、Identify、フレーム時間の最悪値
+
+完成レビュー:
+- BLACK 中は Identify も出さない。Identify の自動表示は起動時だけ(本番中の再全画面化で客席に番号を出さない)
+- 「操作画面 = primary」を前提にしない: Controls の初期位置 / F2 は「出力ではない画面」。全画面化した画面に Controls が乗っていたら退避
+- `--output-monitor N` が存在しない番号なら窓のまま(別画面へ勝手に出さない)
+- 窓の変更(combo / F11)は次フレーム頭で適用(そのフレームの viewport 矩形と framebuffer を食い違わせない)
+- モニター列挙が一瞬 0 件 → 前の一覧を保持して次フレーム再試行。vidmode の無いモニターは候補にしない
+- 抜けた時に戻す窓サイズを primary の work area に収める。combo の選択は番号でなく画面で追う
+- `--black`、BLACK 中は Controls に赤い帯

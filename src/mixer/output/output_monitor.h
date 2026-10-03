@@ -19,7 +19,7 @@ struct MonitorInfo {
 // requested: 0-based index from --output-monitor / the Controls combo, or -1
 // for automatic. Automatic = the first non-primary monitor. Returns -1 when
 // the output should stay a normal window (no monitors, or only the primary
-// and nothing was asked for). An out-of-range request falls back to automatic.
+// and nothing was asked for, or the requested one does not exist).
 int chooseOutputMonitor(const std::vector<MonitorInfo>& mons, int requested);
 
 // After a hot-plug the list is re-enumerated and indices may have shifted.

@@ -25,6 +25,10 @@
 #include "vj/PrimitiveStream.h"
 #include "vj/RtMidiController.h"
 
+#ifdef _WIN32
+#include <windows.h>  // GetModuleFileNameA for the imgui.ini path
+#endif
+
 #include <GLFW/glfw3.h>
 
 namespace {
@@ -962,6 +966,7 @@ int main(int argc, char** argv) {
     bool        cliCrowd   = false;   // --crowd: audience control on at boot
     bool        cliWindowed = false;  // --windowed: no automatic fullscreen
     int         cliOutputMonitor = -1;  // --output-monitor N (1-based)
+    bool        cliBlack   = false;   // --black: start with the output black
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--attach-a") == 0 && i + 1 < argc) {
             cliAttachA = argv[++i];
@@ -973,6 +978,8 @@ int main(int argc, char** argv) {
             cliWindowed = true;
         } else if (std::strcmp(argv[i], "--output-monitor") == 0 && i + 1 < argc) {
             cliOutputMonitor = std::atoi(argv[++i]) - 1;  // shown 1-based
+        } else if (std::strcmp(argv[i], "--black") == 0) {
+            cliBlack = true;
         }
     }
 
@@ -1166,32 +1173,46 @@ int main(int argc, char** argv) {
     //   F12  BLACK (output goes black, gauge included)
     bool showUI          = true;
     bool recallControls  = false;
-    bool blackout        = false;
+    bool blackout        = cliBlack;
+    bool hideOutputPointer = true;
+    // Where the Controls window is (desktop coords), to move it off the
+    // projector when the output goes fullscreen on top of it.
+    ImVec2 controlsPos(0, 0), controlsSize(0, 0);
+    // Window changes asked for during a frame (combo, F11) are applied at the
+    // start of the next one, so the frame's viewport rect, draw data and
+    // framebuffer size all agree.
+    constexpr int kOutputNoChange = -100;
+    constexpr int kOutputLeave    = -1;
+    int pendingOutput = kOutputNoChange;
     std::vector<vjmix::MonitorInfo> monInfos;
     bool  outputFullscreen = false;
     int   outputMonitor    = -1;   // index into monInfos while fullscreen
     vjmix::MonitorInfo outputMonitorInfo;
     int   monitorSel       = 0;    // the Controls combo
+    vjmix::MonitorInfo monitorSelInfo;  // to find it again after a re-list
     double identifyUntil   = 0.0;  // show "OUTPUT n" on the output until then
     int  saveWinX = 0, saveWinY = 0, saveWinW = 0, saveWinH = 0;
     bool saveWinMaximized = false;
     // Frame time, so "it feels heavy" at a venue becomes a number.
     double frameMsMax = 0.0, frameMsMaxShown = 0.0, frameMsWindowStart = 0.0;
 
-    auto enumerateMonitors = [&]() {
-        monInfos.clear();
+    // Returns false (and keeps the previous list) when Windows briefly
+    // reports no monitors mid-switch; the caller retries next frame.
+    auto enumerateMonitors = [&]() -> bool {
         int n = 0;
         GLFWmonitor** ms = glfwGetMonitors(&n);
+        if (n <= 0 || !ms) return false;
+        monInfos.clear();
         GLFWmonitor* prim = glfwGetPrimaryMonitor();
         for (int i = 0; i < n; ++i) {
             vjmix::MonitorInfo m;
             const char* name = glfwGetMonitorName(ms[i]);
             m.name = name ? name : "?";
             glfwGetMonitorPos(ms[i], &m.x, &m.y);
-            if (const GLFWvidmode* vm = glfwGetVideoMode(ms[i])) {
-                m.w = vm->width;
-                m.h = vm->height;
-            }
+            const GLFWvidmode* vm = glfwGetVideoMode(ms[i]);
+            if (!vm) continue;  // no mode yet: never offer a 0x0 target
+            m.w = vm->width;
+            m.h = vm->height;
             m.primary = (ms[i] == prim);
             float sx = 1.0f, sy = 1.0f;
             glfwGetMonitorContentScale(ms[i], &sx, &sy);
@@ -1200,7 +1221,41 @@ int main(int argc, char** argv) {
                          static_cast<double>(sx), m.primary ? " primary" : "");
             monInfos.push_back(m);
         }
-        if (monitorSel >= static_cast<int>(monInfos.size())) monitorSel = 0;
+        if (monInfos.empty()) return false;
+        // Keep the combo on the same physical screen, not the same number.
+        int sel = vjmix::findSameMonitor(monInfos, monitorSelInfo);
+        if (sel < 0) sel = vjmix::chooseOutputMonitor(monInfos, -1);
+        if (sel < 0) sel = 0;
+        monitorSel     = sel;
+        monitorSelInfo = monInfos[static_cast<size_t>(sel)];
+        return true;
+    };
+    // Work area of a screen that is not showing the output: the primary
+    // unless the output is on it, else the first other one. Controls go
+    // there on first run and on F2. With one screen there is nowhere else.
+    auto controlsHome = [&](int& x, int& y, int& w, int& h) {
+        x = 0; y = 0; w = 1280; h = 720;
+        int n = 0;
+        GLFWmonitor** ms = glfwGetMonitors(&n);
+        GLFWmonitor* prim = glfwGetPrimaryMonitor();
+        auto showsOutput = [&](GLFWmonitor* m) {
+            if (!outputFullscreen || !m) return false;
+            int mx = 0, my = 0;
+            glfwGetMonitorPos(m, &mx, &my);
+            const char* nm = glfwGetMonitorName(m);
+            return mx == outputMonitorInfo.x && my == outputMonitorInfo.y &&
+                   outputMonitorInfo.name == (nm ? nm : "?");
+        };
+        GLFWmonitor* pick = nullptr;
+        if (prim && !showsOutput(prim)) {
+            pick = prim;
+        } else {
+            for (int i = 0; i < n && !pick; ++i) {
+                if (!showsOutput(ms[i])) pick = ms[i];
+            }
+        }
+        if (!pick) pick = prim;
+        if (pick) glfwGetMonitorWorkarea(pick, &x, &y, &w, &h);
     };
     auto enterFullscreen = [&](int idx) {
         if (idx < 0 || idx >= static_cast<int>(monInfos.size())) return;
@@ -1220,7 +1275,14 @@ int main(int argc, char** argv) {
         outputMonitor     = idx;
         outputMonitorInfo = m;
         monitorSel        = idx;
-        identifyUntil     = glfwGetTime() + 3.0;
+        monitorSelInfo    = m;
+        // Controls sitting on that screen would now be on the projector.
+        const float cx = controlsPos.x + controlsSize.x * 0.5f;
+        const float cy = controlsPos.y + controlsSize.y * 0.5f;
+        if (controlsSize.x > 0.0f &&
+            cx >= m.x && cx < m.x + m.w && cy >= m.y && cy < m.y + m.h) {
+            recallControls = true;
+        }
         std::fprintf(stderr, "[output] fullscreen on monitor %d (%s)\n",
                      idx + 1, m.name.c_str());
     };
@@ -1232,17 +1294,21 @@ int main(int argc, char** argv) {
         outputMonitor    = -1;
         glfwSetWindowAttrib(window, GLFW_DECORATED, GLFW_TRUE);
         int x = saveWinX, y = saveWinY;
+        int w = saveWinW > 0 ? saveWinW : 1024;
+        int h = saveWinH > 0 ? saveWinH : 720;
         if (toPrimary) {
-            int wx = 0, wy = 0, ww = 0, wh = 0;
+            int wx = 0, wy = 0, ww = 1280, wh = 720;
             if (GLFWmonitor* prim = glfwGetPrimaryMonitor()) {
                 glfwGetMonitorWorkarea(prim, &wx, &wy, &ww, &wh);
             }
             x = wx + 80;
             y = wy + 80;
+            if (w > ww - 160) w = ww - 160;  // saved on a bigger screen
+            if (h > wh - 160) h = wh - 160;
+            if (w < 320) w = 320;
+            if (h < 240) h = 240;
         }
-        glfwSetWindowMonitor(window, nullptr, x, y,
-                             saveWinW > 0 ? saveWinW : 1024,
-                             saveWinH > 0 ? saveWinH : 720, GLFW_DONT_CARE);
+        glfwSetWindowMonitor(window, nullptr, x, y, w, h, GLFW_DONT_CARE);
         if (saveWinMaximized && !toPrimary) glfwMaximizeWindow(window);
         std::fprintf(stderr, "[output] windowed%s\n", toPrimary ? " (monitor lost)" : "");
     };
@@ -1250,9 +1316,15 @@ int main(int argc, char** argv) {
     enumerateMonitors();
     {
         const int idx = vjmix::chooseOutputMonitor(monInfos, cliOutputMonitor);
-        if (idx >= 0) monitorSel = idx;
+        if (idx >= 0) {
+            monitorSel     = idx;
+            monitorSelInfo = monInfos[static_cast<size_t>(idx)];
+        }
         if (!cliWindowed && idx >= 0) {
             enterFullscreen(idx);
+            // Once, at boot, so the VJ sees which screen got the picture.
+            // Not on later re-fullscreens: the room would see it mid-set.
+            identifyUntil = glfwGetTime() + 3.0;
         } else {
             std::fprintf(stderr, "[output] staying windowed (%s)\n",
                          cliWindowed ? "--windowed" : "no second monitor");
@@ -1330,9 +1402,9 @@ int main(int argc, char** argv) {
         // A projector came or went: re-list, and if the output was on the
         // one that left, drop back to a window on the primary screen.
         if (g_monitorsChanged) {
-            g_monitorsChanged = false;
-            enumerateMonitors();
-            if (outputFullscreen) {
+            // A 0-monitor blip leaves the flag set: try again next frame.
+            g_monitorsChanged = !enumerateMonitors();
+            if (!g_monitorsChanged && outputFullscreen) {
                 const int idx = vjmix::findSameMonitor(monInfos, outputMonitorInfo);
                 if (idx < 0) {
                     leaveFullscreen(true);
@@ -1340,6 +1412,11 @@ int main(int argc, char** argv) {
                     enterFullscreen(idx);  // re-fit: its mode may have changed
                 }
             }
+        }
+        if (pendingOutput != kOutputNoChange) {
+            if (pendingOutput == kOutputLeave) leaveFullscreen(false);
+            else                               enterFullscreen(pendingOutput);
+            pendingOutput = kOutputNoChange;
         }
 
         // Pull any pending MIDI CC values into Twin Self params before any
@@ -1415,10 +1492,12 @@ int main(int argc, char** argv) {
             recallControls = true;
         }
         if (ImGui::IsKeyPressed(ImGuiKey_F11, false)) {
-            if (outputFullscreen) leaveFullscreen(false);
-            else                  enterFullscreen(monitorSel);
+            pendingOutput = outputFullscreen ? kOutputLeave : monitorSel;
         }
-        if (ImGui::IsKeyPressed(ImGuiKey_F12, false)) blackout = !blackout;
+        if (ImGui::IsKeyPressed(ImGuiKey_F12, false)) {
+            blackout = !blackout;
+            identifyUntil = 0.0;
+        }
 
         {
             const double ms = dt * 1000.0;
@@ -1464,12 +1543,10 @@ int main(int argc, char** argv) {
 
         if (showUI) {
         {
-            // First run (no imgui.ini) or F2: top-left of the primary
-            // screen's work area, sized to fit a 768-px-high laptop.
+            // First run (no imgui.ini) or F2: top-left of a screen that is
+            // not the projector, sized to fit a 768-px-high laptop.
             int wx = 0, wy = 0, ww = 1280, wh = 720;
-            if (GLFWmonitor* prim = glfwGetPrimaryMonitor()) {
-                glfwGetMonitorWorkarea(prim, &wx, &wy, &ww, &wh);
-            }
+            controlsHome(wx, wy, ww, wh);
             const float cw = (ww - 80 < 560) ? static_cast<float>(ww - 80) : 560.0f;
             const float ch = (wh - 80 < 820) ? static_cast<float>(wh - 80) : 820.0f;
             const ImGuiCond cond = recallControls ? ImGuiCond_Always
@@ -1480,6 +1557,19 @@ int main(int argc, char** argv) {
             recallControls = false;
         }
         if (ImGui::Begin("Controls", &showUI)) {
+            controlsPos  = ImGui::GetWindowPos();
+            controlsSize = ImGui::GetWindowSize();
+            if (blackout) {
+                // The room sees black; the VJ must not have to guess why.
+                ImGui::PushStyleColor(ImGuiCol_Button,        IM_COL32(200, 20, 20, 255));
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, IM_COL32(230, 40, 40, 255));
+                ImGui::PushStyleColor(ImGuiCol_ButtonActive,  IM_COL32(160, 10, 10, 255));
+                if (ImGui::Button("BLACK - output is black  (F12 / click to show)",
+                                  ImVec2(-1, 48))) {
+                    blackout = false;
+                }
+                ImGui::PopStyleColor(3);
+            }
             if (ImGui::CollapsingHeader("Output", ImGuiTreeNodeFlags_DefaultOpen)) {
                 auto monLabel = [&](int i) {
                     const vjmix::MonitorInfo& m = monInfos[static_cast<size_t>(i)];
@@ -1495,9 +1585,10 @@ int main(int argc, char** argv) {
                 if (ImGui::BeginCombo("##outmon", cur.c_str())) {
                     for (int i = 0; i < static_cast<int>(monInfos.size()); ++i) {
                         if (ImGui::Selectable(monLabel(i).c_str(), i == monitorSel)) {
-                            monitorSel = i;
-                            // Already fullscreen: move the picture now.
-                            if (outputFullscreen && i != outputMonitor) enterFullscreen(i);
+                            monitorSel     = i;
+                            monitorSelInfo = monInfos[static_cast<size_t>(i)];
+                            // Already fullscreen: move the picture (next frame).
+                            if (outputFullscreen && i != outputMonitor) pendingOutput = i;
                         }
                     }
                     ImGui::EndCombo();
@@ -1505,15 +1596,17 @@ int main(int argc, char** argv) {
                 if (outputFullscreen) {
                     ImGui::Text("Fullscreen on monitor %d", outputMonitor + 1);
                     ImGui::SameLine();
-                    if (ImGui::Button("Window (F11)")) leaveFullscreen(false);
+                    if (ImGui::Button("Window (F11)")) pendingOutput = kOutputLeave;
                 } else {
                     ImGui::TextUnformatted("Windowed");
                     ImGui::SameLine();
-                    if (ImGui::Button("Fullscreen on selected (F11)")) enterFullscreen(monitorSel);
+                    if (ImGui::Button("Fullscreen on selected (F11)")) pendingOutput = monitorSel;
                 }
                 if (ImGui::Button("Identify")) identifyUntil = now + 3.0;
                 ImGui::SameLine();
                 ImGui::Checkbox("BLACK (F12)", &blackout);
+                ImGui::SameLine();
+                ImGui::Checkbox("Hide pointer on output", &hideOutputPointer);
                 ImGui::Text("frame %.1f ms   worst in 2 s: %.1f ms",
                             dt * 1000.0, frameMsMaxShown);
                 ImGui::TextDisabled("F1 hide controls  F2 recall controls");
@@ -2142,7 +2235,7 @@ int main(int argc, char** argv) {
 
         // Identify: a big number on the output, so the VJ can tell which
         // screen the room is looking at (venues reorder / swap primaries).
-        if (now < identifyUntil) {
+        if (!blackout && now < identifyUntil) {
             ImDrawList* dl = ImGui::GetForegroundDrawList(outVp);
             char ibuf[64];
             if (outputFullscreen) {
@@ -2163,7 +2256,10 @@ int main(int argc, char** argv) {
         // No pointer over the projected picture. ImGui's cursor request is
         // applied to every OS window, but the pointer can only be over one of
         // them, so asking for "none" while it is over the output is enough.
-        if (outputFullscreen && glfwGetWindowAttrib(window, GLFW_HOVERED)) {
+        // Known compromise: if the loop stalls just as the pointer moves
+        // to Controls, it stays hidden there until the next frame.
+        if (hideOutputPointer && outputFullscreen &&
+            glfwGetWindowAttrib(window, GLFW_HOVERED)) {
             ImGui::SetMouseCursor(ImGuiMouseCursor_None);
         }
 

@@ -36,7 +36,7 @@ int main() {
     check(vjmix::chooseOutputMonitor(two, -1) == 1, "two screens, auto -> non-primary");
     check(vjmix::chooseOutputMonitor(twoRev, -1) == 0, "non-primary listed first, negative x");
     check(vjmix::chooseOutputMonitor(two, 0) == 0, "explicit request wins");
-    check(vjmix::chooseOutputMonitor(two, 7) == 1, "out-of-range request -> auto");
+    check(vjmix::chooseOutputMonitor(two, 7) == -1, "out-of-range request -> windowed, not a guess");
     check(vjmix::chooseOutputMonitor(projPrimary, -1) == 1,
           "projector is primary -> auto picks laptop (needs Identify / combo)");
 

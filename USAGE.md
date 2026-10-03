@@ -105,6 +105,39 @@ for the same 1024×512 region). To get a clean two-game mix:
 - Slide the value between 0 and 512 for a continuous "collision amount"
   knob — partway sometimes looks better than either extreme.
 
+## Show setup: projector + laptop
+
+The mixer opens two OS windows:
+
+- **Output** — the picture and the CROWD gauge, nothing else. Goes on the
+  projector.
+- **Controls** — every menu and effect setting. Stays on the laptop.
+
+Before the show, set Windows to **Extend** (Win+P). In *Duplicate* mode
+Windows reports one screen and there is nowhere to separate the two.
+
+At boot the Output goes borderless-fullscreen on the first screen that is
+not the Windows primary, shows `OUTPUT n` for 3 seconds, and Controls opens
+on a screen that is not the Output. If the venue made the projector the
+primary, pick the right screen in **Controls > Output** (the picture moves
+at once) or start with `--output-monitor N`.
+
+| Key | What it does (works with either window in front) |
+|---|---|
+| F11 | Output: fullscreen on the selected screen <-> normal window |
+| F12 | BLACK. Output goes fully black; Controls shows a red bar |
+| F1  | Hide / show Controls |
+| F2  | Bring Controls back to a screen that is not the Output |
+
+Command line: `--windowed` (no automatic fullscreen), `--output-monitor N`
+(1-based, as listed in Controls and the log; a number that does not exist
+stays windowed), `--black` (start black).
+
+If the projector cable is pulled, the Output drops back to a normal window
+on the primary screen. Keys only work while one of the two mixer windows is
+in front; for an emergency at the venue, also know where the switcher's own
+black is.
+
 ## Recorded files (.vjr)
 
 You can also point pcsx-redux at the file recorder
