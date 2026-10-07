@@ -2,6 +2,7 @@
 // loaded .vjr file (M2) + a tiny GL renderer for untextured polygons
 // (M3). M4 will add textured polys; subsequent milestones blend modes etc.
 
+#include <algorithm>
 #include <cfloat>
 #include <cstdio>
 #include <cstdlib>
@@ -70,6 +71,30 @@ constexpr int kPS1Width  = 320;
 constexpr int kPS1Height = 240;
 constexpr int kVRAMWidth  = 1024;
 constexpr int kVRAMHeight = 512;
+
+// The fork sends vertices with the GPU drawing offset already added, i.e. in
+// VRAM space. Double-buffered games alternate that offset between the top
+// buffer (y 0) and one below it (y 240), so every other frame arrived 240
+// lines down, fell outside the 320x240 view and the output blinked black at
+// 30 Hz. Measured on Nekketsu Oyako: frames alternate y 0..273 / 240..513
+// with no primitive straddling. When nearly the whole frame sits in the
+// lower buffer, move it back up. (PAL titles that use 256 end up 16 lines
+// low; horizontal double buffering is not handled.)
+constexpr float kLowerBufferY = 240.0f;
+// Returns true if the frame was moved.
+bool liftLowerBuffer(std::vector<vj::Primitive>& prims) {
+    if (prims.empty()) return false;
+    size_t lower = 0;
+    for (const auto& p : prims) {
+        float minY = 1e9f;
+        for (const auto& v : p.vertices) minY = std::min(minY, v.y);
+        if (minY >= kLowerBufferY - 8.0f) ++lower;
+    }
+    if (lower * 10 < prims.size() * 9) return false;
+    for (auto& p : prims)
+        for (auto& v : p.vertices) v.y -= kLowerBufferY;
+    return true;
+}
 
 // Unpack the on-wire Primitive layout (matches packPrimitiveForLive in
 // the pcsx-redux fork: kind/textured/vc/blend + 8-byte hostTag + N*20 +
@@ -172,6 +197,7 @@ bool loadRecording(const std::string& path, LoadedRecording& out, LoadStatus& st
     }
     vj::EchoFrame frame;
     while (reader.readNextFrame(frame)) {
+        liftLowerBuffer(frame.primitives);  // .vjr files carry the same VRAM y
         out.totalPrimitives += frame.primitives.size();
         out.frames.push_back(std::move(frame));
         frame = vj::EchoFrame{};
@@ -1104,6 +1130,7 @@ int main(int argc, char** argv) {
         uint32_t             lastResync = 0;    // reader resyncs already handled
         int                  heldRun = 0;       // consecutive FrameEnds not committed
         int                  framesHeld = 0;    // total, for the Controls readout
+        int                  framesLifted = 0;  // frames moved up from the lower buffer
         vj::PrimitiveRingbuffer history{300};  // 5 s at 60 fps
     };
     LiveChannel chA, chB;
@@ -1492,6 +1519,7 @@ int main(int argc, char** argv) {
                         continue;
                     }
                     ch.heldRun = 0;
+                    if (liftLowerBuffer(ch.building.primitives)) ++ch.framesLifted;
                     ch.building.frameIndex = static_cast<int>(fi);
                     ch.latest = std::move(ch.building);
                     ch.building.primitives.clear();
@@ -1666,8 +1694,8 @@ int main(int argc, char** argv) {
                     }
                 }
                 if (ch.reader.isOpen()) {
-                    ImGui::Text("  %d frames | held=%d | dropped=%u | resync=%u | hb=%u",
-                                ch.framesSeen, ch.framesHeld,
+                    ImGui::Text("  %d frames | lifted=%d | held=%d | dropped=%u | resync=%u | hb=%u",
+                                ch.framesSeen, ch.framesLifted, ch.framesHeld,
                                 ch.reader.droppedCount(),
                                 ch.reader.resyncCount(),
                                 ch.reader.writerHeartbeat());
