@@ -1101,6 +1101,9 @@ int main(int argc, char** argv) {
         vj::EchoFrame        latest;
         bool                 hasFrame = false;
         int                  framesSeen = 0;
+        uint32_t             lastDropped = 0;   // ring drop count at last FrameEnd
+        int                  heldRun = 0;       // consecutive FrameEnds not committed
+        int                  framesHeld = 0;    // total, for the Controls readout
         vj::PrimitiveRingbuffer history{300};  // 5 s at 60 fps
     };
     LiveChannel chA, chB;
@@ -1463,6 +1466,27 @@ int main(int argc, char** argv) {
                 } else if (type == vjmix::IpcRecordType::FrameEnd) {
                     uint32_t fi = 0;
                     if (len >= 4) std::memcpy(&fi, liveRecBuf.data(), 4);
+                    // The fork emits a FrameEnd every VSync, drawn or not. A
+                    // VSync where the game drew nothing (30 fps titles every
+                    // other one, loads, lag) or where the ring dropped records
+                    // would replace the picture with an empty or torn one, and
+                    // since we clear and redraw each frame the whole output
+                    // blinks black. The real PS1 keeps showing its framebuffer,
+                    // so keep showing the last good frame instead. Uploads stay
+                    // in `building` and go out with the next committed frame.
+                    // Bounded, so a game that really goes blank still goes blank.
+                    const uint32_t dropped = ch.reader.droppedCount();
+                    const bool torn  = dropped != ch.lastDropped;
+                    const bool empty = ch.building.primitives.empty();
+                    ch.lastDropped = dropped;
+                    constexpr int kMaxHeld = 6;  // 0.1 s at 60 fps
+                    if (ch.hasFrame && (empty || torn) && ch.heldRun < kMaxHeld) {
+                        ch.building.primitives.clear();
+                        ++ch.heldRun;
+                        ++ch.framesHeld;
+                        continue;
+                    }
+                    ch.heldRun = 0;
                     ch.building.frameIndex = static_cast<int>(fi);
                     ch.latest = std::move(ch.building);
                     ch.building.primitives.clear();
@@ -1637,8 +1661,9 @@ int main(int argc, char** argv) {
                     }
                 }
                 if (ch.reader.isOpen()) {
-                    ImGui::Text("  %d frames | dropped=%u | hb=%u",
-                                ch.framesSeen, ch.reader.droppedCount(),
+                    ImGui::Text("  %d frames | held=%d | dropped=%u | hb=%u",
+                                ch.framesSeen, ch.framesHeld,
+                                ch.reader.droppedCount(),
                                 ch.reader.writerHeartbeat());
                 } else {
                     ImGui::TextDisabled("  (idle)");
