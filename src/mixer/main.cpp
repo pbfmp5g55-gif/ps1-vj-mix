@@ -87,7 +87,7 @@ bool liftLowerBuffer(std::vector<vj::Primitive>& prims) {
     size_t lower = 0;
     for (const auto& p : prims) {
         float minY = 1e9f;
-        for (const auto& v : p.vertices) minY = std::min(minY, v.y);
+        for (const auto& v : p.vertices) if (v.y < minY) minY = v.y;
         if (minY >= kLowerBufferY - 8.0f) ++lower;
     }
     if (lower * 10 < prims.size() * 9) return false;
