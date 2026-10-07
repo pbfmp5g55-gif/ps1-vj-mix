@@ -42,9 +42,15 @@ jobs:
           New-Item -ItemType Directory -Force release
           Copy-Item build\vj-mix-spike1.exe        release\
           Copy-Item build\vj-mix-ipc-selftest.exe  release\
+          Copy-Item build\vj-mix-output-selftest.exe release\
           Copy-Item README.md                       release\
           Copy-Item -Recurse design                 release\
           if (Test-Path USAGE.md) { Copy-Item USAGE.md release\ }
+          if (Test-Path HANDOVER_ja.md) { Copy-Item HANDOVER_ja.md release\ }
+          # Ready-to-run kit: start-vj.bat fetches the emulator on first run.
+          Copy-Item kit\*                           release\
+          Copy-Item start-crowd.bat                 release\
+          Copy-Item -Recurse crowd-server           release\
           Compress-Archive -Path release\* -DestinationPath ps1-vj-mix-windows-x64.zip
         shell: pwsh
 
