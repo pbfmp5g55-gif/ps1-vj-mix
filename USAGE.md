@@ -10,7 +10,11 @@ primitive stream over IPC. The pcsx-redux fork lives at:
   (2026-05-15) was tested on. Older forks degrade in specific ways:
   v0.7.0 leaves `hostTag=0` so Clean CLUT goes black, and anything
   before v0.7.10 has a smaller IPC ring that drops frames on
-  sprite-heavy scenes.
+  sprite-heavy scenes. **v0.7.11** also tells the mixer where each frame
+  sits in VRAM and the display size (Controls shows `src=fork`); with an
+  older fork the mixer guesses (`src=guess`): PAL titles that put their
+  second buffer at y=256 land 16 lines low and wide modes (368/384) are
+  cut at 320.
 
 Both repos are Windows-only at the moment.
 

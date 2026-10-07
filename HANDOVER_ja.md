@@ -18,7 +18,7 @@ UI が個別にバラける。2台のエミュを走らせて混ぜられる。
 | リポジトリ | 中身 | 最新版 | ライセンス |
 |---|---|---|---|
 | `ps1-primitive-vj` | **libvj**。グリッチ本体(頂点ずらし/UVずらし/間引き/色/描画順遅延)、MIDI、フィルタプリセット、ストリーム形式 | main のみ(タグ無し) | MIT |
-| `pcsx-redux`(フォーク) | エミュ本体。`vj-integration` ブランチ。命令を横取りして共有メモリへ送る側 | **v0.7.10** | GPL v2 |
+| `pcsx-redux`(フォーク) | エミュ本体。`vj-integration` ブランチ。命令を横取りして共有メモリへ送る側 | **v0.7.11** | GPL v2 |
 | `ps1-vj-mix` | **ミキサー**。2チャンネル受けて混ぜて描く。実演で触るのはこれ | **v0.10.2** | MIT |
 
 `ps1-vj-mix` は libvj を `third_party/libvj/` に **git submodule** で抱えている。
@@ -46,7 +46,7 @@ UI が個別にバラける。2台のエミュを走らせて混ぜられる。
 
 詳細は `USAGE.md`。最短は:
 
-1. GitHub Releases から `pcsx-redux` フォーク **v0.7.10** と `ps1-vj-mix` **v0.10.2** の ZIP を落とす
+1. GitHub Releases から `pcsx-redux` フォーク **v0.7.11** と `ps1-vj-mix` **v0.10.2** の ZIP を落とす
 2. `openbios.bin`(524288 バイト、MIT)を `pcsx-redux.exe` の隣に置く
 3. `pcsx-redux.exe -bios openbios.bin -iso <game.cue> -vjring Local\vj-mix-prim-A -run`
 4. `vj-mix-spike1.exe --attach-a Local\vj-mix-prim-A`
@@ -60,6 +60,12 @@ ALL OK ならミキサー側は正常 → エミュ側(Start live 押したか�
   パレット参照が VRAM(0,0) を見にいく
 - **チラつく / `dropped=` が増える** → IPC リングが溢れている。フォーク v0.7.10 で
   32MB になっている。スプライトの多い場面は 8MB では足りない
+- **画面全体が30Hzで真っ黒に点滅する**(dropped=0 なのに)→ ダブルバッファの下の段が
+  画面外に出ている。v0.7.11 フォークなら Controls に `src=fork` が出て直る。
+  `src=guess` なら y=240 を仮定して戻している(design/FRAME_ORIGIN.md)。
+  わざと点滅させたい時は Space 長押し(FLICKER、3秒で自動停止)
+- **画面が止まって dropped だけ増える** → リーダーが記録の境目を見失った。
+  e0bdb05 以降は自動で読み直す(Controls の `resync=`)。根本原因は未特定
 - **Phase C で絵が壊れる** → CLUT モードは *Clean CLUT (inline palette)* を使う。
   VRAM を移動させると VRAM 参照版のパレット読みは付いてこない
 - **グリッチ8種は MIDI で回せない**。CC が割り当ててあるのは Twin Self 3種 /
