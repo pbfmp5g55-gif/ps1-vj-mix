@@ -1105,7 +1105,8 @@ int main(int argc, char** argv) {
     int clutModeCC   = 17;
     int crossfadeCC  = 18;
     int relocateCC   = 19;
-    int midiLearnTarget = -1;  // 0..2 = twin, 3 = clutMode, 4 = crossfade, 5 = relocate
+    int flickerCC    = 28;  // momentary pad: >= 64 while held
+    int midiLearnTarget = -1;  // 0..2 = twin, 3 = clutMode, 4 = crossfade, 5 = relocate, 6 = flicker
     int midiLearnSeenCC = -1;
     auto applyMidiOverrides = [&]() {
         if (!midi || !midiOverrideEnabled) return;
@@ -1201,9 +1202,10 @@ int main(int argc, char** argv) {
     //   F2   pull the Controls window back onto the primary monitor
     //   F11  output: borderless fullscreen on the selected monitor <-> window
     //   F12  BLACK (output goes black, gauge included)
-    //   Space (hold) FLICKER: stop lifting lower-buffer frames, so the
-    //        output blinks at the game's frame rate. Cut after kFlickerMaxSec
-    //        held: a long full-screen strobe is a risk for the audience.
+    //   Space (hold) FLICKER, also the button or MIDI CC >= 64: stop lifting
+    //        lower-buffer frames, so the output blinks at the game's frame
+    //        rate. Cut after kFlickerMaxSec held: a long full-screen strobe
+    //        is a risk for the audience.
     bool showUI          = true;
     bool flickerOn         = false;  // read by drainChannel (one frame late)
     bool flickerButtonDown = false;  // Controls button, from the last frame
@@ -1566,7 +1568,8 @@ int main(int argc, char** argv) {
         {
             const bool want =
                 (!io.WantCaptureKeyboard && ImGui::IsKeyDown(ImGuiKey_Space)) ||
-                flickerButtonDown;
+                flickerButtonDown ||
+                (midi && midi->getCC(flickerCC) >= 64);
             flickerButtonDown = false;  // the button re-arms it while held
             if (!want) {
                 flickerSince = -1.0;
@@ -2104,6 +2107,7 @@ int main(int argc, char** argv) {
             bindingRow("CLUT mode",          &clutModeCC,   3, "(6 bands: Direct/Discard/Noise/Clean(VRAM)/Shape/Clean(inline))");
             bindingRow("Crossfade A<->B",    &crossfadeCC,  4, "(0..127 -> 0..1)");
             bindingRow("B VRAM relocate",    &relocateCC,   5, "(0..127 -> 0..512, B chaos vs C clean)");
+            bindingRow("FLICKER (hold)",     &flickerCC,    6, "(>=64 while held; pad in CC mode, 3 s max)");
 
             // Process learn: poll lastReceivedCC; when it changes commit it.
             if (midi && midiLearnTarget >= 0) {
@@ -2116,6 +2120,7 @@ int main(int argc, char** argv) {
                         case 3: clutModeCC   = latest; break;
                         case 4: crossfadeCC  = latest; break;
                         case 5: relocateCC   = latest; break;
+                        case 6: flickerCC    = latest; break;
                     }
                     midiLearnTarget = -1;
                 }

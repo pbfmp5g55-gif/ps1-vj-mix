@@ -128,6 +128,7 @@ at once) or start with `--output-monitor N`.
 | F12 | BLACK. Output goes fully black; Controls shows a red bar |
 | F1  | Hide / show Controls |
 | F2  | Bring Controls back to a screen that is not the Output |
+| Space (hold) | FLICKER: lets double-buffered games blink at their frame rate, for a hit. Same as the Controls button or a MIDI pad on the `FLICKER (hold)` CC (default 28, >= 64 while held). Cuts out after 3 s held; let go to re-arm |
 
 Command line: `--windowed` (no automatic fullscreen), `--output-monitor N`
 (1-based, as listed in Controls and the log; a number that does not exist
