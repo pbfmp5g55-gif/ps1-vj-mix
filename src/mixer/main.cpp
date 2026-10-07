@@ -103,10 +103,13 @@ bool liftLowerBuffer(std::vector<vj::Primitive>& prims) {
 // at a VSync points at the *other* buffer - the previous VSync's value is
 // the one that matches. Jet Ace is PAL with its second buffer at y=256.
 struct FrameMeta {
-    bool     valid = false;
+    bool     originOk = false;  // drawing area start usable as the origin
+    bool     viewOk = false;    // display size usable as the view extent
     int      areaX = 0, areaY = 0;
     int      dispX = 0, dispY = 0, dispW = 0, dispH = 0;
-    uint32_t flags = 0;
+    uint32_t flags = 0, frameIndex = 0, gen = 0;
+    int      areaWrites = -1;   // E3/E4 writes this frame, -1 = not sent (48-byte FMD1)
+    bool     startSeen = true;  // GP1(05) written since reset (assumed for 48-byte FMD1)
 };
 FrameMeta parseFrameMeta(const uint8_t* b, size_t len) {
     FrameMeta m;
@@ -114,29 +117,46 @@ FrameMeta parseFrameMeta(const uint8_t* b, size_t len) {
     if (len < 48) return m;
     uint32_t magic = 0;
     std::memcpy(&magic, b + 4, 4);
-    if (magic != 0x31444D46u || u16(8) < 48) return m;
+    const int size = u16(8);
+    if (magic != 0x31444D46u || size < 48 || static_cast<size_t>(size) > len) return m;
+    std::memcpy(&m.frameIndex, b, 4);
+    std::memcpy(&m.gen, b + 44, 4);
     m.flags = static_cast<uint32_t>(u16(10));
     m.areaX = u16(28); m.areaY = u16(30);
     m.dispX = u16(36); m.dispY = u16(38);
     m.dispW = u16(40); m.dispH = u16(42);
+    bool modeSeen = true;
+    if (size >= 52) {
+        m.areaWrites = u16(48);
+        const int seen = u16(50);
+        m.startSeen = (seen & 1) != 0;
+        modeSeen    = (seen & 6) == 6;  // GP1(07) and GP1(08) since reset
+    }
     // Out of range = no metadata (never clamp a bad value into a good-looking one).
     const bool widthOk = m.dispW == 256 || m.dispW == 320 || m.dispW == 368 ||
                          m.dispW == 384 || m.dispW == 512 || m.dispW == 640;
-    m.valid = widthOk && m.dispH >= 16 && m.dispH <= 512 &&
-              m.areaX < kVRAMWidth && m.areaY < kVRAMHeight;
+    m.originOk = m.areaX < kVRAMWidth && m.areaY < kVRAMHeight;
+    m.viewOk   = modeSeen && widthOk && m.dispH >= 16 && m.dispH <= 512;
     return m;
 }
-// The frame origin: the drawing area start, snapped to the previous VSync's
-// display start when that is within 32 px (a game that clips its drawing
-// area a little inside the buffer would otherwise be shifted by the clip).
-void frameOrigin(const FrameMeta& m, const FrameMeta& prev, int& ox, int& oy) {
+// The frame origin. An empirical rule from 3 titles, not GPU semantics:
+// the drawing area start, snapped to the previous VSync's display start
+// when that is within 32 px (a game that clips its drawing area a little
+// inside the buffer would otherwise be shifted by the clip). Snap only when
+// the previous FrameEnd really is the previous VSync of the same stream:
+// after a drop, reconnect or emulator restart it can be anything.
+bool frameOrigin(const FrameMeta& m, const FrameMeta& prev, int& ox, int& oy) {
     ox = m.areaX;
     oy = m.areaY;
-    if (prev.valid && std::abs(prev.dispX - m.areaX) <= 32 &&
+    const bool consecutive = prev.originOk && prev.startSeen && prev.gen == m.gen &&
+                             prev.frameIndex + 1 == m.frameIndex;
+    if (consecutive && std::abs(prev.dispX - m.areaX) <= 32 &&
         std::abs(prev.dispY - m.areaY) <= 32) {
         ox = prev.dispX;
         oy = prev.dispY;
+        return true;
     }
+    return false;
 }
 
 // Unpack the on-wire Primitive layout (matches packPrimitiveForLive in
@@ -1180,6 +1200,10 @@ int main(int argc, char** argv) {
         FrameMeta            meta, prevMeta;    // FMD1 of the last / previous FrameEnd
         int                  originX = 0, originY = 0;
         bool                 fromMeta = false;  // last committed frame placed by FMD1
+        bool                 snapped = false;   // ...from the previous display start
+        int                  framesAreaMoved = 0;  // drawing area moved mid-frame
+        float                viewW = static_cast<float>(kPS1Width);
+        float                viewH = static_cast<float>(kPS1Height);
         vj::PrimitiveRingbuffer history{300};  // 5 s at 60 fps
     };
     LiveChannel chA, chB;
@@ -1582,9 +1606,16 @@ int main(int argc, char** argv) {
                     ch.heldRun = 0;
                     // Place the frame: FMD1 from the fork when it is there,
                     // else the lower-buffer guess. FLICKER draws raw VRAM y.
-                    ch.fromMeta = ch.meta.valid;
-                    if (ch.meta.valid) {
-                        frameOrigin(ch.meta, ch.prevMeta, ch.originX, ch.originY);
+                    ch.fromMeta = ch.meta.originOk;
+                    ch.viewW = ch.meta.viewOk ? static_cast<float>(ch.meta.dispW)
+                                              : static_cast<float>(kPS1Width);
+                    ch.viewH = ch.meta.viewOk ? static_cast<float>(ch.meta.dispH)
+                                              : static_cast<float>(kPS1Height);
+                    if (ch.meta.originOk) {
+                        // More than the usual one area set per frame means
+                        // the prims were not all drawn under this origin.
+                        if (ch.meta.areaWrites > 2) ++ch.framesAreaMoved;
+                        ch.snapped = frameOrigin(ch.meta, ch.prevMeta, ch.originX, ch.originY);
                         if (!flickerOn && (ch.originX || ch.originY)) {
                             const float fx = static_cast<float>(ch.originX);
                             const float fy = static_cast<float>(ch.originY);
@@ -1793,10 +1824,24 @@ int main(int argc, char** argv) {
                                 ch.reader.droppedCount(),
                                 ch.reader.resyncCount(),
                                 ch.reader.writerHeartbeat());
-                    if (ch.fromMeta)
-                        ImGui::Text("  src=fork  origin=%d,%d  display %dx%d%s",
-                                    ch.originX, ch.originY, ch.meta.dispW, ch.meta.dispH,
-                                    (ch.meta.flags & 4u) ? " PAL" : "");
+                    if (ch.fromMeta) {
+                        char view[48];
+                        if (ch.meta.viewOk)
+                            std::snprintf(view, sizeof(view), "%dx%d%s", ch.meta.dispW,
+                                          ch.meta.dispH, (ch.meta.flags & 4u) ? " PAL" : "");
+                        else
+                            std::snprintf(view, sizeof(view), "320x240 (no display info yet)");
+                        ImGui::Text("  src=fork  origin=%d,%d (%s)  view %s", ch.originX,
+                                    ch.originY, ch.snapped ? "display" : "area", view);
+                        // Modes the placement rule was never measured on.
+                        const uint32_t f = ch.meta.flags;
+                        if ((f & 8u) || (f & 2u) || !(f & 1u) || ch.framesAreaMoved)
+                            ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f),
+                                               "  untested here:%s%s%s%s",
+                                               (f & 8u) ? " 24-bit" : "", (f & 2u) ? " interlaced" : "",
+                                               !(f & 1u) ? " display off" : "",
+                                               ch.framesAreaMoved ? " area moved mid-frame" : "");
+                    }
                     else
                         ImGui::TextDisabled("  src=guess (fork older than 0.7.11: lower buffer at y=240 assumed)");
                 } else {
@@ -2212,16 +2257,6 @@ int main(int argc, char** argv) {
             (chA.reader.isOpen() && chA.hasFrame) ||
             (chB.reader.isOpen() && chB.hasFrame);
         const bool haveSource = liveActive || !recording.frames.empty();
-        // One view for both channels: A's display size if the fork sent it,
-        // else B's, else 320x240 (recordings, old forks).
-        {
-            const LiveChannel* vs = (chA.hasFrame && chA.fromMeta) ? &chA
-                                  : (chB.hasFrame && chB.fromMeta) ? &chB : nullptr;
-            renderer.viewW = vs && liveActive ? static_cast<float>(vs->meta.dispW)
-                                              : static_cast<float>(kPS1Width);
-            renderer.viewH = vs && liveActive ? static_cast<float>(vs->meta.dispH)
-                                              : static_cast<float>(kPS1Height);
-        }
         if (haveSource && renderer.program && !blackout) {
             const float aspectPSX = static_cast<float>(kPS1Width) /
                                     static_cast<float>(kPS1Height);
@@ -2243,6 +2278,10 @@ int main(int argc, char** argv) {
                 auto submitChan = [&](const LiveChannel& ch, float keepProb,
                                       float xRelocate) {
                     if (!ch.hasFrame) return;
+                    // Each channel at its own display size: A 320x240 and a
+                    // PAL 368-wide B both fill the same 4:3 view.
+                    renderer.viewW = ch.viewW;
+                    renderer.viewH = ch.viewH;
                     renderer.applyUploads(ch.latest.uploads,
                                           static_cast<int>(xRelocate));
                     // Twin Self ghost: draw delayed history first, dimmed, so
@@ -2298,7 +2337,9 @@ int main(int argc, char** argv) {
                 submitChan(chB, crossfade,        relocateBX);
                 ++vjFrameCounter;
             } else {
-                // File mode (existing behaviour).
+                // File mode (existing behaviour). Recordings carry no FMD1.
+                renderer.viewW = static_cast<float>(kPS1Width);
+                renderer.viewH = static_cast<float>(kPS1Height);
                 const vj::EchoFrame& fr =
                     recording.frames[static_cast<size_t>(currentFrame)];
                 renderer.applyUploads(fr.uploads);
