@@ -96,6 +96,49 @@ bool liftLowerBuffer(std::vector<vj::Primitive>& prims) {
     return true;
 }
 
+// FrameEnd metadata 'FMD1' from fork 0.7.11+ (layout: design/FRAME_ORIGIN.md).
+// Measured on Nekketsu / Jet Ace / PSXFunkin: the drawing area start (GP0 E3)
+// is this frame's buffer origin (98-100% of vertices in view), the per-prim
+// drawing offset is not (Nekketsu keeps it at 0,0), and the display start
+// at a VSync points at the *other* buffer - the previous VSync's value is
+// the one that matches. Jet Ace is PAL with its second buffer at y=256.
+struct FrameMeta {
+    bool     valid = false;
+    int      areaX = 0, areaY = 0;
+    int      dispX = 0, dispY = 0, dispW = 0, dispH = 0;
+    uint32_t flags = 0;
+};
+FrameMeta parseFrameMeta(const uint8_t* b, size_t len) {
+    FrameMeta m;
+    auto u16 = [b](size_t o) { return static_cast<int>(b[o] | (b[o + 1] << 8)); };
+    if (len < 48) return m;
+    uint32_t magic = 0;
+    std::memcpy(&magic, b + 4, 4);
+    if (magic != 0x31444D46u || u16(8) < 48) return m;
+    m.flags = static_cast<uint32_t>(u16(10));
+    m.areaX = u16(28); m.areaY = u16(30);
+    m.dispX = u16(36); m.dispY = u16(38);
+    m.dispW = u16(40); m.dispH = u16(42);
+    // Out of range = no metadata (never clamp a bad value into a good-looking one).
+    const bool widthOk = m.dispW == 256 || m.dispW == 320 || m.dispW == 368 ||
+                         m.dispW == 384 || m.dispW == 512 || m.dispW == 640;
+    m.valid = widthOk && m.dispH >= 16 && m.dispH <= 512 &&
+              m.areaX < kVRAMWidth && m.areaY < kVRAMHeight;
+    return m;
+}
+// The frame origin: the drawing area start, snapped to the previous VSync's
+// display start when that is within 32 px (a game that clips its drawing
+// area a little inside the buffer would otherwise be shifted by the clip).
+void frameOrigin(const FrameMeta& m, const FrameMeta& prev, int& ox, int& oy) {
+    ox = m.areaX;
+    oy = m.areaY;
+    if (prev.valid && std::abs(prev.dispX - m.areaX) <= 32 &&
+        std::abs(prev.dispY - m.areaY) <= 32) {
+        ox = prev.dispX;
+        oy = prev.dispY;
+    }
+}
+
 // Unpack the on-wire Primitive layout (matches packPrimitiveForLive in
 // the pcsx-redux fork: kind/textured/vc/blend + 8-byte hostTag + N*20 +
 // paletteKind byte + optional palette[16|256]*2 bytes). The trailing
@@ -660,8 +703,7 @@ struct Renderer {
         if (buf.empty()) return;
         glViewport(viewportX, viewportY, viewportW, viewportH);
         vjgl_UseProgram(program);
-        vjgl_Uniform2f(uPsxSize, static_cast<float>(kPS1Width),
-                       static_cast<float>(kPS1Height));
+        vjgl_Uniform2f(uPsxSize, viewW, viewH);
         vjgl_Uniform1f(uDitherStrength, ditherStrength);
         vjgl_BindVertexArray(vao);
         vjgl_BindBuffer(GL_ARRAY_BUFFER, vbo);
@@ -818,14 +860,17 @@ struct Renderer {
 
     GLint texUClutMode = -1;
     int   clutMode = 0;  // 0=Direct 1=Discard 2=Noise 3=Clean(VRAM) 4=Shape 5=Clean(inline)
+    // PS1 pixels mapped onto the view. 320x240 unless the fork reports the
+    // display size (FMD1). Presentation stays 4:3 either way.
+    float viewW = static_cast<float>(kPS1Width);
+    float viewH = static_cast<float>(kPS1Height);
 
     void submitTex(const std::vector<float>& buf, int viewportX, int viewportY,
                    int viewportW, int viewportH) {
         if (buf.empty()) return;
         glViewport(viewportX, viewportY, viewportW, viewportH);
         vjgl_UseProgram(texProgram);
-        vjgl_Uniform2f(texUPsxSize, static_cast<float>(kPS1Width),
-                       static_cast<float>(kPS1Height));
+        vjgl_Uniform2f(texUPsxSize, viewW, viewH);
         vjgl_Uniform2f(texUVramSize, static_cast<float>(kVRAMWidth),
                        static_cast<float>(kVRAMHeight));
         if (texUClutMode < 0) {
@@ -1132,6 +1177,9 @@ int main(int argc, char** argv) {
         int                  heldRun = 0;       // consecutive FrameEnds not committed
         int                  framesHeld = 0;    // total, for the Controls readout
         int                  framesLifted = 0;  // frames moved up from the lower buffer
+        FrameMeta            meta, prevMeta;    // FMD1 of the last / previous FrameEnd
+        int                  originX = 0, originY = 0;
+        bool                 fromMeta = false;  // last committed frame placed by FMD1
         vj::PrimitiveRingbuffer history{300};  // 5 s at 60 fps
     };
     LiveChannel chA, chB;
@@ -1509,6 +1557,10 @@ int main(int argc, char** argv) {
                 } else if (type == vjmix::IpcRecordType::FrameEnd) {
                     uint32_t fi = 0;
                     if (len >= 4) std::memcpy(&fi, liveRecBuf.data(), 4);
+                    // Every FrameEnd, held or not: the previous VSync's display
+                    // start is what frameOrigin() snaps to.
+                    ch.prevMeta = ch.meta;
+                    ch.meta = parseFrameMeta(liveRecBuf.data(), len);
                     // The fork emits a FrameEnd every VSync, drawn or not. A
                     // VSync where the game drew nothing (30 fps titles every
                     // other one, loads, lag) would replace the picture with an
@@ -1528,8 +1580,20 @@ int main(int argc, char** argv) {
                         continue;
                     }
                     ch.heldRun = 0;
-                    if (!flickerOn && liftLowerBuffer(ch.building.primitives))
+                    // Place the frame: FMD1 from the fork when it is there,
+                    // else the lower-buffer guess. FLICKER draws raw VRAM y.
+                    ch.fromMeta = ch.meta.valid;
+                    if (ch.meta.valid) {
+                        frameOrigin(ch.meta, ch.prevMeta, ch.originX, ch.originY);
+                        if (!flickerOn && (ch.originX || ch.originY)) {
+                            const float fx = static_cast<float>(ch.originX);
+                            const float fy = static_cast<float>(ch.originY);
+                            for (auto& p : ch.building.primitives)
+                                for (auto& v : p.vertices) { v.x -= fx; v.y -= fy; }
+                        }
+                    } else if (!flickerOn && liftLowerBuffer(ch.building.primitives)) {
                         ++ch.framesLifted;
+                    }
                     ch.building.frameIndex = static_cast<int>(fi);
                     ch.latest = std::move(ch.building);
                     ch.building.primitives.clear();
@@ -1729,6 +1793,12 @@ int main(int argc, char** argv) {
                                 ch.reader.droppedCount(),
                                 ch.reader.resyncCount(),
                                 ch.reader.writerHeartbeat());
+                    if (ch.fromMeta)
+                        ImGui::Text("  src=fork  origin=%d,%d  display %dx%d%s",
+                                    ch.originX, ch.originY, ch.meta.dispW, ch.meta.dispH,
+                                    (ch.meta.flags & 4u) ? " PAL" : "");
+                    else
+                        ImGui::TextDisabled("  src=guess (fork older than 0.7.11: lower buffer at y=240 assumed)");
                 } else {
                     ImGui::TextDisabled("  (idle)");
                 }
@@ -2142,6 +2212,16 @@ int main(int argc, char** argv) {
             (chA.reader.isOpen() && chA.hasFrame) ||
             (chB.reader.isOpen() && chB.hasFrame);
         const bool haveSource = liveActive || !recording.frames.empty();
+        // One view for both channels: A's display size if the fork sent it,
+        // else B's, else 320x240 (recordings, old forks).
+        {
+            const LiveChannel* vs = (chA.hasFrame && chA.fromMeta) ? &chA
+                                  : (chB.hasFrame && chB.fromMeta) ? &chB : nullptr;
+            renderer.viewW = vs && liveActive ? static_cast<float>(vs->meta.dispW)
+                                              : static_cast<float>(kPS1Width);
+            renderer.viewH = vs && liveActive ? static_cast<float>(vs->meta.dispH)
+                                              : static_cast<float>(kPS1Height);
+        }
         if (haveSource && renderer.program && !blackout) {
             const float aspectPSX = static_cast<float>(kPS1Width) /
                                     static_cast<float>(kPS1Height);
