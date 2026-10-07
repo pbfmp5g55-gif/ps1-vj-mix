@@ -29,7 +29,7 @@ if not exist "%MIXER%" goto nomixer
 
 if exist "%EMU_A%\pcsx-redux.exe" goto haveA
 echo.
-echo   Downloading the emulator (pcsx-redux VJ fork %FORK_TAG%), about 40 MB ...
+echo   Downloading the emulator (pcsx-redux VJ fork %FORK_TAG%), about 44 MB ...
 echo.
 powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; $ProgressPreference='SilentlyContinue'; $z=Join-Path $env:TEMP 'psvj-fork.zip'; Invoke-WebRequest -UseBasicParsing '%FORK_URL%' -OutFile $z; Expand-Archive -Force $z '%EMU_A%'; Remove-Item $z"
 if errorlevel 1 goto dlfail
@@ -43,17 +43,63 @@ xcopy /e /i /q /y "%EMU_A%" "%EMU_B%" >nul
 if errorlevel 1 goto copyfail
 
 :runAB
+set TRIES=0
+:runAB_A
 start "" /d "%EMU_A%" "%EMU_A%\pcsx-redux.exe" -bios "%BIOS%" -iso "%~f1" -vjring Local\vj-mix-prim-A -run
+if not errorlevel 1 goto runAB_B
+call :retry
+if errorlevel 1 goto startfail
+goto runAB_A
+:runAB_B
+set TRIES=0
+:runAB_B2
 start "" /d "%EMU_B%" "%EMU_B%\pcsx-redux.exe" -bios "%BIOS%" -iso "%~f2" -vjring Local\vj-mix-prim-B -run
-timeout /t 5 /nobreak >nul
+if not errorlevel 1 goto runAB_mix
+call :retry
+if errorlevel 1 goto startfail
+goto runAB_B2
+:runAB_mix
+call :wait 5
 start "" /d "%~dp0" "%MIXER%" --attach-a Local\vj-mix-prim-A --attach-b Local\vj-mix-prim-B
 goto end
 
 :runA
+set TRIES=0
+:runA_A
 start "" /d "%EMU_A%" "%EMU_A%\pcsx-redux.exe" -bios "%BIOS%" -iso "%~f1" -vjring Local\vj-mix-prim-A -run
-timeout /t 5 /nobreak >nul
+if not errorlevel 1 goto runA_mix
+call :retry
+if errorlevel 1 goto startfail
+goto runA_A
+:runA_mix
+call :wait 5
 start "" /d "%~dp0" "%MIXER%" --attach-a Local\vj-mix-prim-A
 goto end
+
+rem Freshly unpacked exes can be refused ("Access is denied") while
+rem security software decides about them (a scan, or a "new program
+rem detected" prompt waiting for an answer). Wait and try again, 5 max.
+:retry
+set /a TRIES+=1
+if %TRIES% gtr 5 exit /b 1
+echo   Windows refused to start the emulator. If a security warning popped up
+echo   ("new program detected"), answer it with Allow. Retrying ...
+call :wait 3
+exit /b 0
+
+rem ping instead of timeout: timeout fails when input is redirected.
+:wait
+ping -n %1 127.0.0.1 >nul
+exit /b 0
+
+:startfail
+echo.
+echo   The emulator would not start after 5 tries ("Access is denied").
+echo   Security software is blocking pcsx-redux.exe in this folder. Allow it
+echo   in the warning window (or ask whoever runs this PC), then run again.
+echo.
+pause
+exit /b 1
 
 :usage
 echo.

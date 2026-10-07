@@ -67,7 +67,9 @@ Unzip `ps1-vj-mix-windows-x64.zip` anywhere and drag one or two `.cue`
 files onto `start-vj.bat` (two = channels A and B). The first run downloads
 the emulator (fork v0.7.11, ~40 MB) into `pcsx-redux-A` and copies it to
 `pcsx-redux-B` for a second game. `openbios.bin` (PCSX-Redux OpenBIOS, MIT,
-see `OPENBIOS_LICENSE.txt`) is in the zip; games are not.
+see `OPENBIOS_LICENSE.txt`) is in the zip; games are not. Security software
+may stop the freshly downloaded `pcsx-redux.exe` with a "new program"
+prompt on first run; the script retries 5 times and then says so.
 
 ## Quick start (1 emulator + mixer)
 
