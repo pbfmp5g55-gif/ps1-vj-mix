@@ -1101,7 +1101,7 @@ int main(int argc, char** argv) {
         vj::EchoFrame        latest;
         bool                 hasFrame = false;
         int                  framesSeen = 0;
-        uint32_t             lastDropped = 0;   // ring drop count at last FrameEnd
+        uint32_t             lastResync = 0;    // reader resyncs already handled
         int                  heldRun = 0;       // consecutive FrameEnds not committed
         int                  framesHeld = 0;    // total, for the Controls readout
         vj::PrimitiveRingbuffer history{300};  // 5 s at 60 fps
@@ -1450,6 +1450,13 @@ int main(int argc, char** argv) {
                 size_t len = 0;
                 if (!ch.reader.readRecord(type, liveRecBuf.data(),
                                           liveRecBuf.size(), len)) {
+                    // The reader lost the record boundary and skipped ahead:
+                    // whatever we were assembling is garbage.
+                    if (ch.reader.resyncCount() != ch.lastResync) {
+                        ch.lastResync = ch.reader.resyncCount();
+                        ch.building.primitives.clear();
+                        ch.building.uploads.clear();
+                    }
                     break;
                 }
                 if (len > liveRecBuf.size()) continue;
@@ -1468,19 +1475,17 @@ int main(int argc, char** argv) {
                     if (len >= 4) std::memcpy(&fi, liveRecBuf.data(), 4);
                     // The fork emits a FrameEnd every VSync, drawn or not. A
                     // VSync where the game drew nothing (30 fps titles every
-                    // other one, loads, lag) or where the ring dropped records
-                    // would replace the picture with an empty or torn one, and
-                    // since we clear and redraw each frame the whole output
-                    // blinks black. The real PS1 keeps showing its framebuffer,
-                    // so keep showing the last good frame instead. Uploads stay
-                    // in `building` and go out with the next committed frame.
-                    // Bounded, so a game that really goes blank still goes blank.
-                    const uint32_t dropped = ch.reader.droppedCount();
-                    const bool torn  = dropped != ch.lastDropped;
-                    const bool empty = ch.building.primitives.empty();
-                    ch.lastDropped = dropped;
+                    // other one, loads, lag) would replace the picture with an
+                    // empty one, and since we clear and redraw each frame the
+                    // whole output blinks black. The real PS1 keeps showing
+                    // its framebuffer, so keep showing the last frame instead.
+                    // Uploads stay in `building` and go out with the next
+                    // committed frame. Bounded, so a game that really goes
+                    // blank still goes blank. (Ring overflow is not a case
+                    // here: the fork drops whole frames, never part of one.)
                     constexpr int kMaxHeld = 6;  // 0.1 s at 60 fps
-                    if (ch.hasFrame && (empty || torn) && ch.heldRun < kMaxHeld) {
+                    if (ch.hasFrame && ch.building.primitives.empty() &&
+                        ch.heldRun < kMaxHeld) {
                         ch.building.primitives.clear();
                         ++ch.heldRun;
                         ++ch.framesHeld;
@@ -1661,9 +1666,10 @@ int main(int argc, char** argv) {
                     }
                 }
                 if (ch.reader.isOpen()) {
-                    ImGui::Text("  %d frames | held=%d | dropped=%u | hb=%u",
+                    ImGui::Text("  %d frames | held=%d | dropped=%u | resync=%u | hb=%u",
                                 ch.framesSeen, ch.framesHeld,
                                 ch.reader.droppedCount(),
+                                ch.reader.resyncCount(),
                                 ch.reader.writerHeartbeat());
                 } else {
                     ImGui::TextDisabled("  (idle)");

@@ -11,6 +11,10 @@
 
 #include "mixer/ipc/ipc_ring.h"
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 // Always-evaluating check (assert() is stripped in NDEBUG / Release builds,
 // which would silently elide the writeRecord/readRecord calls).
 #define CHECK(expr)                                                            \
@@ -122,6 +126,51 @@ void verifyBackpressureDrop() {
                 writesAccepted, r.droppedCount());
 }
 
+#ifdef _WIN32
+void verifyResyncAfterMisalignedRead() {
+    // A readOffset that is off a record boundary used to wedge the ring for
+    // good: garbage length -> readRecord returns false forever -> ring fills
+    // -> every frame dropped -> frozen output. The reader must skip to the
+    // writer's position and carry on.
+    const char* name = "Local\\vj-mix-selftest-resync";
+    vjmix::IpcRingWriter w;
+    CHECK(w.create(name, 4096));
+    vjmix::IpcRingReader r;
+    CHECK(r.open(name));
+
+    std::vector<uint8_t> payload(64, 0x7F);  // 0x7F7F7F7F as a length = garbage
+    CHECK(w.writeRecord(vjmix::IpcRecordType::Primitive, payload.data(), payload.size()));
+    CHECK(w.writeRecord(vjmix::IpcRecordType::Primitive, payload.data(), payload.size()));
+
+    // Knock readOffset into the middle of the first record's payload.
+    HANDLE h = OpenFileMappingA(FILE_MAP_ALL_ACCESS, FALSE, name);
+    CHECK(h != nullptr);
+    auto* hdr = static_cast<vjmix::RingHeader*>(
+        MapViewOfFile(h, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(vjmix::RingHeader)));
+    CHECK(hdr != nullptr);
+    hdr->readOffset += 9;
+
+    vjmix::IpcRecordType t;
+    std::vector<uint8_t> buf(256);
+    size_t len = 0;
+    CHECK(!r.readRecord(t, buf.data(), buf.size(), len));
+    CHECK(r.resyncCount() == 1);
+    CHECK(hdr->readOffset == hdr->writeOffset);
+
+    // Back on a boundary: the next record round-trips.
+    const char msg[] = "after";
+    CHECK(w.writeRecord(vjmix::IpcRecordType::FrameEnd, msg, sizeof(msg)));
+    CHECK(r.readRecord(t, buf.data(), buf.size(), len));
+    CHECK(t == vjmix::IpcRecordType::FrameEnd);
+    CHECK(len == sizeof(msg) && std::memcmp(buf.data(), msg, len) == 0);
+    CHECK(r.resyncCount() == 1);
+
+    UnmapViewOfFile(hdr);
+    CloseHandle(h);
+    std::puts("[selftest] resync after misaligned read OK");
+}
+#endif
+
 }  // namespace
 
 int main() {
@@ -129,6 +178,7 @@ int main() {
     verifyRoundTripBasic();
     verifyWrapAround();
     verifyBackpressureDrop();
+    verifyResyncAfterMisalignedRead();
     std::puts("[selftest] ALL OK");
     return 0;
 #else

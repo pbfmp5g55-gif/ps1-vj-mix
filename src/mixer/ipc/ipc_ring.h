@@ -90,19 +90,22 @@ class IpcRingReader {
     bool isOpen() const { return m_header != nullptr; }
 
     // Try to read one record. If a full record is available, fills the
-    // out fields and advances readOffset; otherwise returns false without
-    // mutating state. payloadBuf is filled with up to maxLen bytes; the
+    // out fields and advances readOffset; otherwise returns false. If the
+    // bytes at readOffset cannot be a record, it skips to the writer's
+    // position and bumps resyncCount() (see readRecord). payloadBuf is filled with up to maxLen bytes; the
     // record's true length is returned via outLen.
     bool readRecord(IpcRecordType& outType,
                     void* payloadBuf, size_t maxLen, size_t& outLen);
 
     uint32_t droppedCount() const { return m_header ? m_header->dropped : 0; }
     uint32_t writerHeartbeat() const { return m_header ? m_header->writerAlive : 0; }
+    uint32_t resyncCount() const { return m_resyncs; }
     size_t   dataSize() const { return m_dataSize; }
 
    private:
     void* m_mapping = nullptr;
     void* m_view    = nullptr;
+    uint32_t    m_resyncs = 0;
     RingHeader* m_header = nullptr;
     uint8_t*    m_data   = nullptr;
     size_t      m_dataSize = 0;

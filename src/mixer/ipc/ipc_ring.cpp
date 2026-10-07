@@ -240,14 +240,26 @@ bool IpcRingReader::readRecord(IpcRecordType& outType,
     const uint64_t writeOff = m_header->writeOffset;
     const uint64_t readOff  = m_header->readOffset;
     const size_t avail = availableForReader(writeOff, readOff, m_dataSize);
-    if (avail < kRecHeaderBytes) return false;
+    if (avail == 0) return false;
+
+    // Both writers publish writeOffset only after a whole record (or a whole
+    // frame) is in place, so a record that does not fit in what is published
+    // can only mean readOffset is no longer on a record boundary. Left alone
+    // that is permanent: the ring fills, every new frame is dropped and the
+    // output freezes. Skip to the writer's position, which is always a
+    // boundary, and let the caller throw away the frame it was building.
+    auto resync = [&]() {
+        m_header->readOffset = writeOff;
+        ++m_resyncs;
+        return false;
+    };
+    if (avail < kRecHeaderBytes) return resync();
 
     uint8_t hdr[kRecHeaderBytes];
     copyOutWrap(hdr, m_data, static_cast<size_t>(readOff), m_dataSize, kRecHeaderBytes);
     uint32_t recBytes = 0;
     std::memcpy(&recBytes, &hdr[0], sizeof(recBytes));
-    if (recBytes < kRecHeaderBytes || recBytes > m_dataSize) return false;
-    if (avail < recBytes) return false;  // record only partially written
+    if (recBytes < kRecHeaderBytes || recBytes > avail) return resync();
 
     outType = static_cast<IpcRecordType>(hdr[4]);
     const size_t payloadLen = recBytes - kRecHeaderBytes;
