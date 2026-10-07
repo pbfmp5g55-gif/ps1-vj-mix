@@ -61,6 +61,14 @@ After unzipping `ps1-vj-mix-windows-x64.zip`:
 | `README.md`                | Project overview.                        |
 | `design/*.md`              | Architecture / IPC / Spike plans.        |
 
+## Quickest start (any Windows PC)
+
+Unzip `ps1-vj-mix-windows-x64.zip` anywhere and drag one or two `.cue`
+files onto `start-vj.bat` (two = channels A and B). The first run downloads
+the emulator (fork v0.7.11, ~40 MB) into `pcsx-redux-A` and copies it to
+`pcsx-redux-B` for a second game. `openbios.bin` (PCSX-Redux OpenBIOS, MIT,
+see `OPENBIOS_LICENSE.txt`) is in the zip; games are not.
+
 ## Quick start (1 emulator + mixer)
 
 1. **Run pcsx-redux** (`pcsx-redux.exe` from the v0.7.x fork ZIP).

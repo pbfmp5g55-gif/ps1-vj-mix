@@ -46,8 +46,18 @@ UI が個別にバラける。2台のエミュを走らせて混ぜられる。
 
 詳細は `USAGE.md`。最短は:
 
-1. GitHub Releases から `pcsx-redux` フォーク **v0.7.11** と `ps1-vj-mix` **v0.10.2** の ZIP を落とす
-2. `openbios.bin`(524288 バイト、MIT)を `pcsx-redux.exe` の隣に置く
+**別のPCで使う(ミキサー v0.11.0 以降)**:
+1. `ps1-vj-mix` の GitHub Releases から `ps1-vj-mix-windows-x64.zip` を落として、好きなフォルダに展開
+2. ゲームの `.cue` を `start-vj.bat` にドラッグ(2本まとめてドラッグすると A/B)
+   - 初回だけ、エミュ(フォーク v0.7.11)を GitHub から自動で落として `pcsx-redux-A` に展開する(ネット要、約40MB)
+   - 2本目用の `pcsx-redux-B` も自動で作る(エミュ2台はフォルダを分ける必要がある)
+   - BIOS(openbios.bin、MIT)は zip に同梱
+3. ゲームのファイル(.cue/.bin)は自分で用意する。zip には入っていない
+
+手で起動する場合:
+
+1. GitHub Releases から `pcsx-redux` フォーク **v0.7.11** と `ps1-vj-mix` の ZIP を落とす
+2. `openbios.bin`(ミキサーの zip に同梱、MIT)を使う
 3. `pcsx-redux.exe -bios openbios.bin -iso <game.cue> -vjring Local\vj-mix-prim-A -run`
 4. `vj-mix-spike1.exe --attach-a Local\vj-mix-prim-A`
 
