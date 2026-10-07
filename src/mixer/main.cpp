@@ -1237,6 +1237,11 @@ int main(int argc, char** argv) {
     // Phase B crossfader: 0 = 100% A, 1 = 100% B. Sources at the midpoint
     // each keep half their primitives via the random gate below.
     float crossfade = 0.0f;
+    // Which primitives survive the crossfade gate. Default: a fixed draw per
+    // primitive (by its index in the frame), so a still scene stays still at
+    // any fader position. Re-roll draws again every frame: the old
+    // behaviour, a 60 Hz sparkle that reads as flicker unless you want it.
+    bool crossfadeReroll = false;
     std::mt19937 cfRng(0x5EED5EED);
     auto rng01 = [&cfRng]() {
         return std::uniform_real_distribution<float>(0.0f, 1.0f)(cfRng);
@@ -1852,6 +1857,7 @@ int main(int argc, char** argv) {
             channelRow(chA, "A");
             channelRow(chB, "B");
             ImGui::SliderFloat("Crossfade A<->B", &crossfade, 0.0f, 1.0f, "%.2f");
+            ImGui::Checkbox("Crossfade sparkle (re-roll every frame)", &crossfadeReroll);
             ImGui::TextDisabled("(0=A only, 0.5=both half-density, 1=B only)");
             ImGui::SliderFloat("B VRAM relocate X", &relocateBX, 0.0f, 512.0f, "%.0f");
             ImGui::TextDisabled("(0 = Phase B chaos, 512 = Phase C clean, mid = partial collision)");
@@ -2275,6 +2281,13 @@ int main(int argc, char** argv) {
                 // crossfade keep-gate, then optionally run them through
                 // libvj's PrimitiveInterceptor for glitch effects, then
                 // draw with the right VRAM x-relocation offset.
+                // Stable per-primitive draw in [0,1): A and B use different
+                // salts so their survivors do not line up.
+                auto stableDraw = [](uint32_t index, uint32_t salt) {
+                    uint32_t h = index * 0x9E3779B1u ^ salt;
+                    h ^= h >> 16; h *= 0x85EBCA6Bu; h ^= h >> 13; h *= 0xC2B2AE35u; h ^= h >> 16;
+                    return static_cast<float>(h >> 8) / 16777216.0f;
+                };
                 auto submitChan = [&](const LiveChannel& ch, float keepProb,
                                       float xRelocate) {
                     if (!ch.hasFrame) return;
@@ -2303,8 +2316,12 @@ int main(int argc, char** argv) {
                     if (keepProb >= 0.999f) {
                         kept = ch.latest.primitives;
                     } else {
+                        const uint32_t salt = (&ch == &chA) ? 0xA5A5A5A5u : 0x5A5A5A5Au;
+                        uint32_t i = 0;
                         for (const auto& p : ch.latest.primitives) {
-                            if (rng01() < keepProb) kept.push_back(p);
+                            const float d = crossfadeReroll ? rng01() : stableDraw(i, salt);
+                            ++i;
+                            if (d < keepProb) kept.push_back(p);
                         }
                     }
                     const std::vector<vj::Primitive>* drawn = &kept;
