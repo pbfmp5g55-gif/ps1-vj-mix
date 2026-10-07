@@ -1201,7 +1201,14 @@ int main(int argc, char** argv) {
     //   F2   pull the Controls window back onto the primary monitor
     //   F11  output: borderless fullscreen on the selected monitor <-> window
     //   F12  BLACK (output goes black, gauge included)
+    //   Space (hold) FLICKER: stop lifting lower-buffer frames, so the
+    //        output blinks at the game's frame rate. Cut after kFlickerMaxSec
+    //        held: a long full-screen strobe is a risk for the audience.
     bool showUI          = true;
+    bool flickerOn         = false;  // read by drainChannel (one frame late)
+    bool flickerButtonDown = false;  // Controls button, from the last frame
+    double flickerSince    = -1.0;
+    constexpr double kFlickerMaxSec = 3.0;
     bool recallControls  = false;
     bool blackout        = cliBlack;
     bool hideOutputPointer = true;
@@ -1519,7 +1526,8 @@ int main(int argc, char** argv) {
                         continue;
                     }
                     ch.heldRun = 0;
-                    if (liftLowerBuffer(ch.building.primitives)) ++ch.framesLifted;
+                    if (!flickerOn && liftLowerBuffer(ch.building.primitives))
+                        ++ch.framesLifted;
                     ch.building.frameIndex = static_cast<int>(fi);
                     ch.latest = std::move(ch.building);
                     ch.building.primitives.clear();
@@ -1554,6 +1562,19 @@ int main(int argc, char** argv) {
         if (ImGui::IsKeyPressed(ImGuiKey_F12, false)) {
             blackout = !blackout;
             identifyUntil = 0.0;
+        }
+        {
+            const bool want =
+                (!io.WantCaptureKeyboard && ImGui::IsKeyDown(ImGuiKey_Space)) ||
+                flickerButtonDown;
+            flickerButtonDown = false;  // the button re-arms it while held
+            if (!want) {
+                flickerSince = -1.0;
+                flickerOn    = false;
+            } else {
+                if (flickerSince < 0.0) flickerSince = now;
+                flickerOn = (now - flickerSince) < kFlickerMaxSec;
+            }
         }
 
         {
@@ -1664,6 +1685,12 @@ int main(int argc, char** argv) {
                 ImGui::Checkbox("BLACK (F12)", &blackout);
                 ImGui::SameLine();
                 ImGui::Checkbox("Hide pointer on output", &hideOutputPointer);
+                ImGui::Button("FLICKER (hold / Space)");
+                flickerButtonDown = ImGui::IsItemActive();
+                ImGui::SameLine();
+                if (flickerOn)                ImGui::TextUnformatted("ON");
+                else if (flickerSince >= 0.0) ImGui::TextDisabled("cut (%.0f s max) - let go", kFlickerMaxSec);
+                else                          ImGui::TextDisabled("off");
                 ImGui::Text("frame %.1f ms   worst in 2 s: %.1f ms",
                             dt * 1000.0, frameMsMaxShown);
                 ImGui::TextDisabled("F1 hide controls  F2 recall controls");
